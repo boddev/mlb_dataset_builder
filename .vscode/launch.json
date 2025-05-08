@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Baseball Predictor",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/algo.py",
+            "args": [
+                "--data-path", "datasets",
+                "--target-date", "2024-05-01",
+                "--lineup-file", "2024_lineups.csv",
+                "--load-models"
+            ],
+            "console": "integratedTerminal"
+        }
+    ]
+}

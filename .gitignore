@@ -1,2 +1,6 @@
 /.venv
 /files
+/datasets
+/models
+/output
+baseball_predictions.log

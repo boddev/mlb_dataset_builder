@@ -1,75 +1,174 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Data Aggregator for Baseball Statistics
+
+This module provides functionality to aggregate baseball statistics
+from individual game files into consolidated datasets for analysis.
+"""
+
 import os
-from datetime import datetime, timedelta
 import pandas as pd
+import glob
+import logging
+from typing import Dict, List, Tuple, Union, Optional
+from datetime import datetime
 
-# Define the start and end dates for the search
-start_date = datetime(2023, 3, 30)
-end_date = datetime(2023, 10, 31)
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("data_aggregation.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# Define the time delta for the search (7 days)
-delta = timedelta(days=7)
-
-# Create an empty list to store the files within 7 days of each date
-files_within_7_days = []
-
-# Loop through each date between the start and end dates
-for date in range(0,(end_date - start_date).days,8):
-    # Calculate the current date
-    current_date = start_date + timedelta(date)
+class BaseballDataAggregator:
+    """
+    A class for aggregating baseball statistics from individual game files.
     
-    # Loop through each file in the 'files' directory
-    for file in os.listdir('files'):
-        # Check if the file is a CSV file
-        if file.endswith('.csv'):
-            # Extract the date from the file name
-            file_date = datetime.strptime(file[:8], '%Y%m%d')
-            
-            # Check if the file date is within 7 days of the current date
-            if abs(current_date - file_date) <= delta:
-                # Add the file to the list of files within 7 days of the current date
-                files_within_7_days.append(file)
-            else:
-                #process and aggregate data here
-                combined_results = pd.DataFrame()
-
-                # Loop through each file in files_within_7_days
-                
-                for file in files_within_7_days:
-                    col_name = 'batting'
-                    if file.find('pitching') > -1:
-                        continue
-                        #col_name = 'pitching'
-                    # Read the contents of the file into a DataFrame
-                    df = pd.read_csv(os.path.join('files', file))
-                    
-                    for r, row in df.iterrows():
-                        name = ''
-                        if col_name == "batting":
-                            theName = row[col_name.capitalize()].split()
-                            for part in range(len(theName)-1):
-                                name = name + ' '+theName[part]
-                        else:
-                            theName = row[col_name.capitalize()].split(',')
-                            name = theName[0]
-                        
-                        df.loc[r, col_name.capitalize()] = name.strip()
-                    
-                    combined_results = pd.concat([df,combined_results])
-                # Drop duplicates from the combined results DataFrame
-                drop_dups = combined_results.drop_duplicates(subset=[col_name.capitalize(), 'Team'])
-                drop_dups = drop_dups.dropna(subset=[col_name.capitalize()])
-                drop_dups = drop_dups.dropna(axis=1, how='all')
-                
-                seven_day = pd.DataFrame()
-                for i, row in drop_dups.iterrows():
-                    
-                    # Query the DataFrame for matching rows
-                    batting = row['Batting']
-                    team = row['Team']
-                    matching_rows = combined_results[(combined_results['Batting'] == batting.strip()) & (combined_results['Team'] == team)]
-                    match_desc = matching_rows.describe()
-                    # Append the matching rows to the combined results DataFrame
-                    seven_day = pd.concat([seven_day,matching_rows])
-                date = delta.days
-                break
+    This class processes individual game statistic files for batting, pitching,
+    and linescore data and consolidates them into unified datasets.
+    """
+    
+    def __init__(self, data_dir: str = 'files'):
+        """
+        Initialize the BaseballDataAggregator with data directory.
         
+        Args:
+            data_dir (str): Path to the directory containing the individual game files.
+        """
+        self.data_dir = data_dir
+        self.logger = logger
+        
+    def aggregate_data(self, output_dir: str = '.', year: str = '2024') -> None:
+        """
+        Aggregate the baseball data from individual game files.
+        
+        Args:
+            output_dir (str): Directory to save the aggregated data files.
+            year (str): Year to include in output filenames.
+            
+        Returns:
+            None
+        """
+        try:
+            self.logger.info(f"Starting data aggregation from {self.data_dir}")
+            
+            # Initialize combined dataframes
+            combined_batting = pd.DataFrame()
+            combined_pitching = pd.DataFrame()
+            combined_linescore = pd.DataFrame()
+            
+            # Function to remove unnamed columns
+            def remove_unnamed_columns(df):
+                return df.loc[:, ~df.columns.str.contains('Unnamed', case=False)]
+            
+            # Get all batting files
+            batting_files = glob.glob(os.path.join(self.data_dir, '*_batting.csv'))
+            self.logger.info(f"Found {len(batting_files)} batting files")
+            
+            # Process batting files
+            for file in batting_files:
+                try:
+                    df = pd.read_csv(file)
+                    df = remove_unnamed_columns(df)
+                    combined_batting = pd.concat([combined_batting, df], ignore_index=True)
+                except Exception as e:
+                    self.logger.error(f"Error processing {file}: {e}")
+            
+            # Get all pitching files
+            pitching_files = glob.glob(os.path.join(self.data_dir, '*_pitching.csv'))
+            self.logger.info(f"Found {len(pitching_files)} pitching files")
+            
+            # Process pitching files
+            for file in pitching_files:
+                try:
+                    df = pd.read_csv(file)
+                    df = remove_unnamed_columns(df)
+                    combined_pitching = pd.concat([combined_pitching, df], ignore_index=True)
+                except Exception as e:
+                    self.logger.error(f"Error processing {file}: {e}")
+            
+            # Get all linescore files
+            linescore_files = glob.glob(os.path.join(self.data_dir, '*_linescore.csv'))
+            self.logger.info(f"Found {len(linescore_files)} linescore files")
+            
+            # Process linescore files
+            for file in linescore_files:
+                try:
+                    df = pd.read_csv(file)
+                    df = remove_unnamed_columns(df)
+                    combined_linescore = pd.concat([combined_linescore, df], ignore_index=True)
+                except Exception as e:
+                    self.logger.error(f"Error processing {file}: {e}")
+            
+            # Clean up data
+            if not combined_batting.empty:
+                # Convert date string to datetime if it's not already
+                if 'Date' in combined_batting.columns and pd.api.types.is_string_dtype(combined_batting['Date']):
+                    combined_batting['Date'] = pd.to_datetime(combined_batting['Date'])
+                combined_batting = combined_batting.sort_values('Date')
+            
+            if not combined_pitching.empty:
+                # Convert date string to datetime if it's not already
+                if 'Date' in combined_pitching.columns and pd.api.types.is_string_dtype(combined_pitching['Date']):
+                    combined_pitching['Date'] = pd.to_datetime(combined_pitching['Date'])
+                combined_pitching = combined_pitching.sort_values('Date')
+            
+            if not combined_linescore.empty:
+                # Convert date string to datetime if it's not already
+                if 'Date' in combined_linescore.columns and pd.api.types.is_string_dtype(combined_linescore['Date']):
+                    combined_linescore['Date'] = pd.to_datetime(combined_linescore['Date'])
+                combined_linescore = combined_linescore.sort_values('Date')
+            
+            # Save combined data
+            batting_output = os.path.join(output_dir, f'{year}_batting.csv')
+            pitching_output = os.path.join(output_dir, f'{year}_pitching.csv')
+            linescore_output = os.path.join(output_dir, f'{year}_linescore.csv')
+            
+            combined_batting.to_csv(batting_output, index=False)
+            combined_pitching.to_csv(pitching_output, index=False)
+            combined_linescore.to_csv(linescore_output, index=False)
+            
+            # Also save as Excel file
+            excel_output = os.path.join(output_dir, f'{year}_stats.xlsx')
+            with pd.ExcelWriter(excel_output, mode='w') as writer:
+                combined_batting.to_excel(writer, sheet_name='batting', index=False)
+                combined_pitching.to_excel(writer, sheet_name='pitching', index=False)
+                combined_linescore.to_excel(writer, sheet_name='linescore', index=False)
+            
+            self.logger.info(f"Data aggregation complete. Files saved to {output_dir}")
+            self.logger.info(f"Batting rows: {len(combined_batting)}, Pitching rows: {len(combined_pitching)}, Linescore rows: {len(combined_linescore)}")
+            
+        except Exception as e:
+            self.logger.error(f"Error during data aggregation: {e}")
+            raise
+
+def main():
+    """
+    Main function to demonstrate usage of the BaseballDataAggregator class.
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Aggregate baseball statistics.')
+    parser.add_argument('--data-dir', type=str, default='files', help='Directory with individual game files.')
+    parser.add_argument('--output-dir', type=str, default='.', help='Directory to save aggregated files.')
+    parser.add_argument('--year', type=str, default='2024', help='Year to include in output filenames.')
+    
+    args = parser.parse_args()
+    
+    # Initialize the aggregator
+    aggregator = BaseballDataAggregator(data_dir=args.data_dir)
+    
+    # Aggregate the data
+    aggregator.aggregate_data(output_dir=args.output_dir, year=args.year)
+    
+    print(f"Data aggregation complete. Files saved to {args.output_dir}")
+
+if __name__ == "__main__":
+    main()
+
