@@ -4,3 +4,4 @@
 /models
 /output
 baseball_predictions.log
+*.csv

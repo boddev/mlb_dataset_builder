@@ -5,12 +5,16 @@
             "name": "Baseball Predictor",
             "type": "python",
             "request": "launch",
-            "program": "${workspaceFolder}/algo.py",
+            "program": "${workspaceFolder}/algov3.py",
             "args": [
                 "--data-path", "datasets",
                 "--target-date", "2024-05-01",
                 "--lineup-file", "2024_lineups.csv",
-                "--load-models"
+                "--enhanced-features",
+                "--train",
+                "--save-models",
+                "--calibration-file", "calibration.csv",
+                "--analyze-errors", "errors.csv"
             ],
             "console": "integratedTerminal"
         }
