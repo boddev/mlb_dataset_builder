@@ -11,8 +11,7 @@
                 "--target-date", "2024-05-01",
                 "--lineup-file", "2024_lineups.csv",
                 "--enhanced-features",
-                "--train",
-                "--save-models",
+                "--load-models",
                 "--calibration-file", "calibration.csv",
                 "--analyze-errors", "errors.csv"
             ],
@@ -20,3 +19,6 @@
         }
     ]
 }
+
+
+
