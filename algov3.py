@@ -361,7 +361,11 @@ class BaseballPredictor:
                         continue
                     
                     # Prepare features and target (similar to _train_batting_models)
-                    X = self.batting_data[['AB', 'BB', 'SO', 'PA', 'Pit', 'Str', 'HR', 'Double', 'Triple', 'SB', 'GDP', 'Home']].copy()
+                    X = self.batting_data[['AB', 'BB', 'SO', 'PA', 'Pit', 'Str', 'HR', 'Double', 'Triple', 'SB', 'GDP', 'Home',
+                          'hit_streak', 'rolling_5_avg', 'rolling_10_avg',  # Add streak features
+                          'opponent_defense', 'ballpark_factor',            # Add context features
+                          'day_of_week', 'game_in_season',                  # Add time features
+                          'ISO', 'BABIP']].copy()                           # Add advanced metrics
                     
                     # Add derived metrics
                     X['BB_per_PA'] = X['BB'] / X['PA'].replace(0, 0.1)
@@ -463,7 +467,11 @@ class BaseballPredictor:
                         continue
                     
                     # Prepare features and target (similar to _train_pitching_models)
-                    X = self.pitching_data[['IP', 'SO', 'BB', 'HR', 'GB', 'FB', 'Str', 'Pit', 'BF', 'Home']].copy()
+                    X = self.pitching_data[['IP', 'SO', 'BB', 'HR', 'GB', 'FB', 'Str', 'Pit', 'BF', 'Home',
+                        'quality_start_streak', 'rolling_3_ERA',            # Streak features
+                        'opponent_offense', 'ballpark_factor',              # Context features
+                        'day_of_week', 'game_in_season', 'days_rest',       # Time features
+                        'FIP', 'BABIP_against']].copy()      
                     
                     # Calculate derived metrics
                     X['K_per_9'] = 9 * X['SO'] / X['IP'].replace(0, 0.1)
@@ -537,10 +545,10 @@ class BaseballPredictor:
         """
         Train team-specific models for predicting win probability.
         
-        This trains a separate model for each team instead of one global model,
-        allowing for team-specific prediction patterns.
+        This enhanced version includes streak data, head-to-head statistics,
+        ballpark factors, and other advanced metrics to improve prediction accuracy.
         """
-        self.logger.info("Training team win prediction models")
+        self.logger.info("Training team win prediction models with enhanced features")
         
         try:
             # Initialize dictionary to store team-specific models
@@ -549,6 +557,68 @@ class BaseballPredictor:
             # Create team performance metrics if not already created
             if not hasattr(self, 'team_records'):
                 self.create_team_performance_metrics()
+            
+            # Initialize ballpark factors if not already created
+            if not hasattr(self, 'ballpark_factors'):
+                self.add_ballpark_factors()
+            
+            # Calculate team streaks
+            team_streaks = {}
+            for team in self.team_records.index:
+                team_games = []
+                # Process linescore data to get recent team results
+                i = 0
+                while i < len(self.linescore_data) - 1:
+                    try:
+                        away_row = self.linescore_data.iloc[i]
+                        home_row = self.linescore_data.iloc[i+1]
+                        
+                        if away_row['Date'] != home_row['Date'] or away_row['AwayTeam'] != home_row['AwayTeam'] or away_row['HomeTeam'] != home_row['HomeTeam']:
+                            i += 1
+                            continue
+                        
+                        # Check if team played in this game
+                        if team in away_row['AwayTeam'] or team in home_row['HomeTeam']:
+                            game_date = home_row['Date']
+                            is_home = (team == home_row['HomeTeam'])
+                            away_runs = float(away_row.get('R', 0))
+                            home_runs = float(home_row.get('R', 0))
+                            team_win = (is_home and home_runs > away_runs) or (not is_home and away_runs > home_runs)
+                            
+                            team_games.append({
+                                'date': game_date,
+                                'win': team_win
+                            })
+                        
+                        i += 2
+                    except Exception as e:
+                        self.logger.warning(f"Error processing game streak at index {i}: {e}")
+                        i += 1
+                
+                # Sort games by date (oldest to newest)
+                team_games.sort(key=lambda x: x['date'])
+                
+                # Calculate current win streak and recent form
+                win_streak = 0
+                recent_wins = 0
+                recent_games = min(10, len(team_games))
+                
+                # Calculate streak (consecutive most recent wins)
+                for i in range(len(team_games)-1, -1, -1):
+                    if team_games[i]['win']:
+                        win_streak += 1
+                    else:
+                        break
+                
+                # Calculate recent form (win % in last 10 games)
+                for i in range(len(team_games)-1, max(len(team_games)-11, -1), -1):
+                    if team_games[i]['win']:
+                        recent_wins += 1
+                
+                team_streaks[team] = {
+                    'win_streak': win_streak,
+                    'recent_win_pct': recent_wins / recent_games if recent_games > 0 else 0.5
+                }
             
             # Process all teams in team_records
             for team_name in self.team_records.index:
@@ -575,6 +645,7 @@ class BaseballPredictor:
                             # Get team names
                             home_team = home_row['HomeTeam']
                             away_team = away_row['AwayTeam']
+                            game_date = home_row['Date']
                             
                             # Get the scores
                             try:
@@ -586,16 +657,44 @@ class BaseballPredictor:
                                 away_record = self.team_records.loc[away_team].copy() if away_team in self.team_records.index else None
                                 
                                 if home_record is not None and away_record is not None:
+                                    # Get head-to-head statistics
+                                    h2h_stats = self.get_head_to_head_stats(home_team, away_team, game_date)
+                                    
                                     # Create features
                                     is_home = (team_name == home_team)
                                     team_win = (is_home and home_runs > away_runs) or (not is_home and away_runs > home_runs)
                                     
+                                    # Create enhanced feature set
                                     features = {
                                         'TeamWinPct': self.team_records.loc[team_name, 'WinPct'],
                                         'OpponentWinPct': self.team_records.loc[away_team if is_home else home_team, 'WinPct'],
                                         'IsHome': 1 if is_home else 0,
                                         'HomeTeamHomeWinPct': home_record['HomeWinPct'],
                                         'AwayTeamAwayWinPct': away_record['AwayWinPct'],
+                                        
+                                        # Add head-to-head statistics
+                                        'H2HWinPct': h2h_stats.get('blended_win_pct', 0.5) if is_home else (1 - h2h_stats.get('blended_win_pct', 0.5)),
+                                        'H2HGameCount': h2h_stats.get('total_games', 0),
+                                        'H2HRunDiff': h2h_stats.get('run_differential', 0) if is_home else -h2h_stats.get('run_differential', 0),
+                                        
+                                        # Add streak features
+                                        'WinStreak': team_streaks.get(team_name, {}).get('win_streak', 0),
+                                        'RecentForm': team_streaks.get(team_name, {}).get('recent_win_pct', 0.5),
+                                        
+                                        # Add run production/prevention metrics
+                                        'RunsPerGame': home_record['rpg'] if is_home else away_record['rpg'],
+                                        'RunsAllowedPerGame': home_record['rapg'] if is_home else away_record['rapg'],
+                                        'RunDifferential': (home_record['runs_scored'] - home_record['runs_allowed']) if is_home 
+                                                        else (away_record['runs_scored'] - away_record['runs_allowed']),
+                                        
+                                        # Add ballpark factors
+                                        'BallparkFactor': self.ballpark_factors.get(home_team, 1.0) if is_home else 1.0,
+                                        
+                                        # Add time-based features
+                                        'DayOfWeek': game_date.dayofweek if isinstance(game_date, pd.Timestamp) else 0,
+                                        'GameInSeason': (game_date - self.linescore_data['Date'].min()).days + 1 if isinstance(game_date, pd.Timestamp) else 0,
+                                        
+                                        # Target variable
                                         'TeamWin': 1 if team_win else 0
                                     }
                                     
@@ -630,7 +729,7 @@ class BaseballPredictor:
                 import xgboost as xgb
                 import lightgbm as lgb
                 
-                # Train the ensemble model
+                # Train the ensemble model with enhanced configuration
                 team_ensemble = VotingClassifier(estimators=[
                     ('lr', LogisticRegression(C=1.0, class_weight='balanced', random_state=42)),
                     ('xgb', xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=3, random_state=42)),
@@ -647,7 +746,21 @@ class BaseballPredictor:
                 accuracy = np.mean(y_pred == y_test)
                 self.logger.info(f"Team win prediction model for {team_name} - Accuracy: {accuracy:.4f}")
                 
-            self.logger.info(f"Trained team models for {len(self.team_models)} teams")
+                # Feature importance analysis (if available)
+                try:
+                    for name, clf in team_ensemble.named_estimators_.items():
+                        if hasattr(clf, 'feature_importances_'):
+                            importances = clf.feature_importances_
+                            indices = np.argsort(importances)[::-1]
+                            feature_names = X.columns
+                            
+                            self.logger.info(f"Top 5 features for {name} model:")
+                            for i in range(min(5, len(indices))):
+                                self.logger.info(f"  {feature_names[indices[i]]}: {importances[indices[i]]:.4f}")
+                except:
+                    pass
+                
+            self.logger.info(f"Trained team models for {len(self.team_models)} teams with enhanced features")
                 
         except Exception as e:
             self.logger.error(f"Error training team models: {e}")
@@ -794,6 +907,20 @@ class BaseballPredictor:
                         'AVG': overall_data['H'].sum() / overall_data['AB'].sum() if overall_data['AB'].sum() > 0 else 0,
                         'OBP': obp
                     }
+                    
+                    # Add these features to 'overall' dictionary
+                    result['overall']['hit_streak'] = batter_data['hit_streak'].iloc[0] if 'hit_streak' in batter_data.columns else 0
+                    result['overall']['rolling_5_avg'] = batter_data['rolling_5_avg'].iloc[0] if 'rolling_5_avg' in batter_data.columns else 0
+                    result['overall']['rolling_10_avg'] = batter_data['rolling_10_avg'].iloc[0] if 'rolling_10_avg' in batter_data.columns else 0
+                    
+                    # Add ballpark factors and opponent adjustments
+                    result['overall']['ballpark_factor'] = batter_data['ballpark_factor'].iloc[0] if 'ballpark_factor' in batter_data.columns else 1.0
+                    result['overall']['opponent_defense'] = batter_data['opponent_defense'].iloc[0] if 'opponent_defense' in batter_data.columns else 1.0
+                    
+                    # Add advanced metrics
+                    result['overall']['ISO'] = batter_data['ISO'].iloc[0] if 'ISO' in batter_data.columns else 0
+                    result['overall']['BABIP'] = batter_data['BABIP'].iloc[0] if 'BABIP' in batter_data.columns else 0
+
 
                 # Calculate home stats
                 if not home_data.empty:
@@ -812,7 +939,7 @@ class BaseballPredictor:
                         'H': home_data['H'].sum(),
                         'BB': bb,
                         'SO': home_data['SO'].sum() if 'SO' in home_data.columns else 0,
-                        'PA': home_data['PA'].sum() if 'PA' in home_data.columns else home_data['AB'].sum() + bb,
+                        'PA': home_data['PA'].sum() if 'PA' in home_data.columns else home_data['Abatter_dataB'].sum() + bb,
                         'R': home_data['R'].sum(),
                         'RBI': home_data['RBI'].sum(),
                         'HR': home_data['HR'].sum() if 'HR' in home_data.columns else 0,
@@ -825,6 +952,9 @@ class BaseballPredictor:
                         'AVG': home_data['H'].sum() / home_data['AB'].sum() if home_data['AB'].sum() > 0 else 0,
                         'OBP': obp
                     }
+
+
+        
 
                 # Calculate away stats
                 if not away_data.empty:
@@ -888,6 +1018,20 @@ class BaseballPredictor:
                         'WHIP': ((overall_data['H'].sum() + overall_data['BB'].sum()) / overall_data['IP'].sum()) 
                             if overall_data['IP'].sum() > 0 and 'BB' in overall_data.columns else 0
                     }
+
+                    result['overall']['quality_start_streak'] = pitcher_data['quality_start_streak'].iloc[0] if 'quality_start_streak' in pitcher_data.columns else 0
+                    result['overall']['rolling_3_ERA'] = pitcher_data['rolling_3_ERA'].iloc[0] if 'rolling_3_ERA' in pitcher_data.columns else 0
+                    
+                    # Add ballpark factors and opponent adjustments
+                    result['overall']['ballpark_factor'] = pitcher_data['ballpark_factor'].iloc[0] if 'ballpark_factor' in pitcher_data.columns else 1.0
+                    result['overall']['opponent_offense'] = pitcher_data['opponent_offense'].iloc[0] if 'opponent_offense' in pitcher_data.columns else 1.0
+                    
+                    # Add advanced metrics
+                    result['overall']['FIP'] = pitcher_data['FIP'].iloc[0] if 'FIP' in pitcher_data.columns else 0
+                    result['overall']['BABIP_against'] = pitcher_data['BABIP_against'].iloc[0] if 'BABIP_against' in pitcher_data.columns else 0
+                    
+                    # Add rest days
+                    result['overall']['days_rest'] = pitcher_data['days_rest'].iloc[0] if 'days_rest' in pitcher_data.columns else 0
                 
                 # Calculate home stats
                 if not home_data.empty:
@@ -1074,357 +1218,904 @@ class BaseballPredictor:
             self.logger.error(f"Error getting team stats for {team_name}: {e}")
             return {}
     
+    def prepare_player_features(self, player_name: str, player_stats: Dict, is_home_game: bool, is_batter: bool) -> Dict:
+        """
+        Prepare feature dictionary for player prediction based on their stats.
+        
+        Args:
+            player_name: Name of the player
+            player_stats: Dictionary of player statistics 
+            is_home_game: Whether the player is playing at home
+            is_batter: Whether the player is a batter (False for pitcher)
+            
+        Returns:
+            Dictionary of features for model input
+        """
+        features_dict = {}
+        
+        # Create appropriate feature vector based on player type
+        if is_batter:
+            features_dict = {
+                'AB': player_stats.get('AB', 0) / max(player_stats.get('games', 1), 1),
+                'H': player_stats.get('H', 0) / max(player_stats.get('games', 1), 1),
+                'BB': player_stats.get('BB', 0) / max(player_stats.get('games', 1), 1),
+                'SO': player_stats.get('SO', 0) / max(player_stats.get('games', 1), 1),
+                'PA': player_stats.get('PA', player_stats.get('AB', 0) + player_stats.get('BB', 0)) / max(player_stats.get('games', 1), 1),
+                'R': player_stats.get('R', 0) / max(player_stats.get('games', 1), 1),
+                'RBI': player_stats.get('RBI', 0) / max(player_stats.get('games', 1), 1),
+                'HR': player_stats.get('HR', 0) / max(player_stats.get('games', 1), 1),
+                'Double': player_stats.get('Double', 0) / max(player_stats.get('games', 1), 1),
+                'Triple': player_stats.get('Triple', 0) / max(player_stats.get('games', 1), 1),
+                'SB': player_stats.get('SB', 0) / max(player_stats.get('games', 1), 1),
+                'GDP': player_stats.get('GDP', 0) / max(player_stats.get('games', 1), 1),
+                'Pit': player_stats.get('Pit', 0) / max(player_stats.get('games', 1), 1),
+                'Str': player_stats.get('Str', 0) / max(player_stats.get('games', 1), 1),
+                'AVG': player_stats.get('AVG', 0),
+                'OBP': player_stats.get('OBP', 0),
+                'Home_True': 1 if is_home_game else 0
+            }
+            
+            # Add streak and enhanced features
+            streak_data = self.get_player_streak_data(player_name, is_batter=True)
+            features_dict.update(streak_data)
+            
+            # Calculate derived metrics
+            pa = max(features_dict['PA'], 0.1)
+            ab = max(features_dict['AB'], 0.1)
+            pit = max(features_dict['Pit'], 1)
+
+            features_dict['BB_per_PA'] = features_dict['BB'] / pa
+            features_dict['SO_per_PA'] = features_dict['SO'] / pa
+            features_dict['Contact_Rate'] = (features_dict['AB'] - features_dict['SO']) / ab
+            features_dict['XBH_per_AB'] = (features_dict['HR'] + features_dict['Double'] + features_dict['Triple']) / ab
+            features_dict['Str_per_Pit'] = features_dict['Str'] / pit
+            features_dict['Power_Factor'] = (features_dict['HR'] * 4 + features_dict['Triple'] * 3 + features_dict['Double'] * 2) / ab
+            
+        else:  # Pitcher
+            features_dict = {
+                'IP': player_stats.get('IP', 0) / max(player_stats.get('games', 1), 1),
+                'H': player_stats.get('H', 0) / max(player_stats.get('games', 1), 1),
+                'R': player_stats.get('R', 0) / max(player_stats.get('games', 1), 1),
+                'ER': player_stats.get('ER', 0) / max(player_stats.get('games', 1), 1),
+                'SO': player_stats.get('SO', 0) / max(player_stats.get('games', 1), 1),
+                'BB': player_stats.get('BB', 0) / max(player_stats.get('games', 1), 1),
+                'HR': player_stats.get('HR', 0) / max(player_stats.get('games', 1), 1),
+                'GB': player_stats.get('GB', 0) / max(player_stats.get('games', 1), 1),
+                'FB': player_stats.get('FB', 0) / max(player_stats.get('games', 1), 1),
+                'Str': player_stats.get('Str', 0) / max(player_stats.get('games', 1), 1),
+                'Pit': player_stats.get('Pit', 0) / max(player_stats.get('games', 1), 1),
+                'BF': player_stats.get('BF', 0) / max(player_stats.get('games', 1), 1),
+                'ERA': player_stats.get('ERA', 0),
+                'WHIP': player_stats.get('WHIP', 0),
+                'Home_True': 1 if is_home_game else 0
+            }
+            
+            # Add streak and enhanced features
+            streak_data = self.get_player_streak_data(player_name, is_batter=False)
+            features_dict.update(streak_data)
+            
+            # Calculate derived metrics
+            ip = max(player_stats.get('IP', 0), 0.1)
+            pit = max(player_stats.get('Pit', 0), 1)
+            fb = max(player_stats.get('FB', 0), 1)
+
+            features_dict['K_per_9'] = 9 * player_stats.get('SO', 0) / ip
+            features_dict['BB_per_9'] = 9 * player_stats.get('BB', 0) / ip
+            features_dict['HR_per_9'] = 9 * player_stats.get('HR', 0) / ip
+            features_dict['Str_pct'] = player_stats.get('Str', 0) / pit
+            features_dict['GB_FB_ratio'] = player_stats.get('GB', 0) / fb
+        
+        return features_dict
+    
+    def get_player_streak_data(self, player_name: str, is_batter: bool) -> Dict:
+        """
+        Get streak and enhanced features for a player.
+        
+        Args:
+            player_name: Name of the player
+            is_batter: Whether the player is a batter (False for pitcher)
+            
+        Returns:
+            Dictionary of streak features
+        """
+        streak_features = {}
+        
+        if is_batter:
+            # Get batting streak data
+            streak_data = self.batting_data[
+                (self.batting_data['Batting'] == player_name) 
+            ].sort_values('Date', ascending=False)
+            
+            if not streak_data.empty:
+                streak_features['hit_streak'] = streak_data['hit_streak'].iloc[0] if 'hit_streak' in streak_data.columns else 0
+                streak_features['rolling_5_avg'] = streak_data['rolling_5_avg'].iloc[0] if 'rolling_5_avg' in streak_data.columns else 0
+                streak_features['rolling_10_avg'] = streak_data['rolling_10_avg'].iloc[0] if 'rolling_10_avg' in streak_data.columns else 0
+                streak_features['opponent_defense'] = streak_data['opponent_defense'].iloc[0] if 'opponent_defense' in streak_data.columns else 1.0
+                streak_features['ballpark_factor'] = streak_data['ballpark_factor'].iloc[0] if 'ballpark_factor' in streak_data.columns else 1.0
+                streak_features['ISO'] = streak_data['ISO'].iloc[0] if 'ISO' in streak_data.columns else 0
+                streak_features['BABIP'] = streak_data['BABIP'].iloc[0] if 'BABIP' in streak_data.columns else 0
+                
+        else:
+            # Get pitching streak data
+            streak_data = self.pitching_data[
+                (self.pitching_data['Pitching'] == player_name)
+            ].sort_values('Date', ascending=False)
+            
+            if not streak_data.empty:
+                streak_features['quality_start_streak'] = streak_data['quality_start_streak'].iloc[0] if 'quality_start_streak' in streak_data.columns else 0
+                streak_features['rolling_3_ERA'] = streak_data['rolling_3_ERA'].iloc[0] if 'rolling_3_ERA' in streak_data.columns else 0
+                streak_features['opponent_offense'] = streak_data['opponent_offense'].iloc[0] if 'opponent_offense' in streak_data.columns else 1.0
+                streak_features['ballpark_factor'] = streak_data['ballpark_factor'].iloc[0] if 'ballpark_factor' in streak_data.columns else 1.0
+                streak_features['FIP'] = streak_data['FIP'].iloc[0] if 'FIP' in streak_data.columns else 0
+                streak_features['BABIP_against'] = streak_data['BABIP_against'].iloc[0] if 'BABIP_against' in streak_data.columns else 0
+                streak_features['days_rest'] = streak_data['days_rest'].iloc[0] if 'days_rest' in streak_data.columns else 0
+        
+        return streak_features
+
+    def get_prediction_model(self, model_dict: Dict, metric: str):
+        """
+        Select the best model to use for prediction.
+        
+        Args:
+            model_dict: Dictionary of available models
+            metric: Statistical metric to predict
+            
+        Returns:
+            The selected model
+        """
+        if isinstance(model_dict, dict):
+            # Choose best model in order of preference
+            if 'ensemble' in model_dict:
+                return model_dict['ensemble']
+            elif 'stacking' in model_dict:
+                return model_dict['stacking']
+            elif 'nn' in model_dict:
+                return model_dict['nn']
+            else:
+                # Use first available model
+                return next(iter(model_dict.values()))
+        else:
+            # If model_dict is already a model, return it
+            return model_dict
+        
+    def match_features_to_model(self, features_df: pd.DataFrame, model) -> pd.DataFrame:
+        """
+        Ensure features match the model's expected input.
+        
+        Args:
+            features_df: DataFrame of features
+            model: Model to match features for
+            
+        Returns:
+            DataFrame with features matched to model requirements
+        """
+        if hasattr(model, 'feature_names_in_'):
+            required_features = model.feature_names_in_
+            
+            # Add missing features with zero values
+            for feature in required_features:
+                if feature not in features_df.columns:
+                    features_df[feature] = 0
+            
+            # Ensure correct column order and remove extra columns
+            return features_df[required_features]
+        
+        # If model doesn't specify required features, return as is
+        return features_df
+        
+    def calculate_confidence_interval(self, prediction: float, model, features: pd.DataFrame) -> Tuple[float, float]:
+        """
+        Calculate confidence interval for a prediction.
+        
+        Args:
+            prediction: The predicted value
+            model: The model used for prediction
+            features: Features used for prediction
+            
+        Returns:
+            Tuple of (lower_bound, upper_bound)
+        """
+        # Calculate standard deviation
+        std_dev = np.std(model.predict(features))
+        
+        # For ensemble models, use predictions from component models if available
+        if hasattr(model, 'estimators_'):
+            predictions = []
+            for estimator in model.estimators_:
+                try:
+                    predictions.append(estimator.predict(features)[0])
+                except:
+                    pass
+            
+            if predictions:
+                std_dev = np.std(predictions)
+        
+        # Calculate confidence interval (95% confidence)
+        lower_bound = max(0, prediction - 1.96 * std_dev)
+        upper_bound = prediction + 1.96 * std_dev
+        
+        return (lower_bound, upper_bound)
     def predict_player_performance(self, player_name: str, is_home_game: bool, 
-                                opponent: str, target_date: str) -> Dict[str, Dict[str, float]]:
+                              opponent: str, target_date: str) -> Dict[str, Dict[str, float]]:
         """
         Predict player performance for an upcoming game.
         
         Args:
-            player_name (str): Name of the player to predict performance for.
-            is_home_game (bool): Whether the player's team is the home team.
-            opponent (str): Name of the opposing team.
-            target_date (str): The date of the game to predict.
+            player_name: Name of the player to predict performance for
+            is_home_game: Whether the player's team is the home team
+            opponent: Name of the opposing team
+            target_date: The date of the game to predict
             
         Returns:
-            Dict[str, Dict[str, float]]: Dictionary containing predicted performance
-                metrics and confidence intervals.
+            Dictionary containing predicted performance metrics and confidence intervals
         """
         try:
+            # Input validation
+            if not player_name or not opponent:
+                self.logger.error("Missing required parameters: player_name or opponent")
+                return {'prediction': {}, 'confidence': {}}
             
-            # First, check if the player is a batter or pitcher
+            # Determine player type
             is_batter = False
             is_pitcher = False
-            
             player_team = None
             
-            # Try to determine if player is a batter
+            # Check if player is a batter
             batter_info = self.batting_data[self.batting_data['Batting'].str.contains(player_name, case=True, na=False)]
             if not batter_info.empty:
                 is_batter = True
                 player_team = batter_info['Team'].iloc[0]
             
-            # Try to determine if player is a pitcher
+            # Check if player is a pitcher
             pitcher_info = self.pitching_data[self.pitching_data['Pitching'].str.contains(player_name, case=True, na=False)]
             if not pitcher_info.empty:
                 is_pitcher = True
                 player_team = pitcher_info['Team'].iloc[0]
             
+            # Handle unknown players
             if not is_batter and not is_pitcher:
                 self.logger.warning(f"Player {player_name} not found in batting or pitching data")
-                return {'prediction': {}, 'confidence': {}}
+                return {'prediction': {}, 'confidence': {}, 'error': 'player_not_found'}
             
-
-            if 'Jordan Montgomery' in player_name:
-                self.logger.info(f"Player {player_name} is Jordan Montgomery, skipping prediction")
-            # Get historical player statistics
+            # Get player's historical statistics
             full_player_stats = self.get_player_stats(player_name, target_date)
             
-            # Get team statistics
-            team_stats = self.get_team_stats(player_team, target_date)
-            opponent_stats = self.get_team_stats(opponent, target_date)
-            
-            prediction_result = {
-                'prediction': {},
-                'confidence': {}
-            }
-            
-
-
+            # Select appropriate stats based on home/away and sample size
             if is_home_game:
                 player_stats = full_player_stats['home']
                 if full_player_stats['overall']['games'] <= 5:
                     player_stats = full_player_stats['overall']
-
                 if player_stats is None:
                     player_stats = full_player_stats['overall']
             else:
                 player_stats = full_player_stats['away']
                 if full_player_stats['overall']['games'] <= 5:
                     player_stats = full_player_stats['overall']
-
                 if player_stats is None:
                     player_stats = full_player_stats['overall']
-
+            
+            # Prepare results dictionary
+            prediction_result = {
+                'prediction': {},
+                'confidence': {}
+            }
+            
+            # Prepare feature dictionary
+            features_dict = self.prepare_player_features(player_name, player_stats, is_home_game, is_batter)
+            
             # Make predictions based on player type
-            # Inside predict_player_performance method, in the is_batter section:
-            if is_batter:
-
-                # Create feature vector for prediction
-                features_dict = {
-                    'AB': player_stats.get('AB', 0) / max(player_stats.get('games', 1), 1),
-                    'H': player_stats.get('H', 0) / max(player_stats.get('games', 1), 1),
-                    'BB': player_stats.get('BB', 0) / max(player_stats.get('games', 1), 1),
-                    'SO': player_stats.get('SO', 0) / max(player_stats.get('games', 1), 1),
-                    'PA': player_stats.get('PA', player_stats.get('AB', 0) + player_stats.get('BB', 0)) / max(player_stats.get('games', 1), 1),
-                    'R': player_stats.get('R', 0) / max(player_stats.get('games', 1), 1),
-                    'RBI': player_stats.get('RBI', 0) / max(player_stats.get('games', 1), 1),
-                    'HR': player_stats.get('HR', 0) / max(player_stats.get('games', 1), 1),
-                    'Double': player_stats.get('Double', 0) / max(player_stats.get('games', 1), 1),
-                    'Triple': player_stats.get('Triple', 0) / max(player_stats.get('games', 1), 1),
-                    'SB': player_stats.get('SB', 0) / max(player_stats.get('games', 1), 1),
-                    'GDP': player_stats.get('GDP', 0) / max(player_stats.get('games', 1), 1),
-                    'Pit': player_stats.get('Pit', 0) / max(player_stats.get('games', 1), 1),
-                    'Str': player_stats.get('Str', 0) / max(player_stats.get('games', 1), 1),
-                    'AVG': player_stats.get('AVG', 0),
-                    'OBP': player_stats.get('OBP', 0),
-                    'Home_True': 1 if is_home_game else 0
-                }
-
-                # Calculate derived metrics
-                pa = max(features_dict['PA'], 0.1)
-                ab = max(features_dict['AB'], 0.1)
-                pit = max(features_dict['Pit'], 1)
-
-                features_dict['BB_per_PA'] = features_dict['BB'] / pa
-                features_dict['SO_per_PA'] = features_dict['SO'] / pa
-                features_dict['Contact_Rate'] = (features_dict['AB'] - features_dict['SO']) / ab
-                features_dict['XBH_per_AB'] = (features_dict['HR'] + features_dict['Double'] + features_dict['Triple']) / ab
-                features_dict['Str_per_Pit'] = features_dict['Str'] / pit
-                features_dict['Power_Factor'] = (features_dict['HR'] * 4 + features_dict['Triple'] * 3 + features_dict['Double'] * 2) / ab
-
-                # Use batting models to make predictions
-                for metric, model in self.batting_models.items():
-                    if isinstance(model, dict):
-                        # Choose which model type to use (for example, 'ensemble')
-                        if 'ensemble' in model:
-                            model_to_use = model['ensemble']
-                        elif 'stacking' in model:
-                            model_to_use = model['stacking']
-                        elif 'nn' in model:
-                            model_to_use = model['nn']
-                        else:
-                            model_to_use = list(model.values())[0]  # Use first available model
-                    else:
-                        model_to_use = model
-
-                    
-                    # Handle missing features based on model requirements
-                    if hasattr(model_to_use, 'feature_names_in_'):
-                        required_features = model_to_use.feature_names_in_
-                        features = pd.DataFrame([features_dict])
-                        
-                        # Add any missing features with default value 0
-                        for feature in required_features:
-                            if feature not in features.columns:
-                                features[feature] = 0
-                                
-                        # Ensure correct column order
-                        features = features[required_features]
-                    else:
-                        features = pd.DataFrame([features_dict])
-                        
-                        # Create DataFrame with exactly the required features in the right order
-                        features = pd.DataFrame([features_dict])[required_features]
-
-                    #self.logger.info(f"Using model type: {type(self.batting_models[metric])}")
-                    # Make prediction
-                    prediction = model_to_use.predict(features)[0]
-
-                    # Convert numpy.int64 to Python int if needed
-                    if isinstance(prediction, np.integer):
-                        prediction = int(prediction)
-                    
-                    # Calculate confidence interval (using model's standard deviation)
-                    std_dev = np.std(model_to_use.predict(features))
-                    lower_bound = max(0, prediction - 1.96 * std_dev)
-                    upper_bound = prediction + 1.96 * std_dev
-                    
-                    # Store prediction and confidence interval
-                    prediction_result['prediction'][metric] = prediction
-                    prediction_result['confidence'][metric] = (lower_bound, upper_bound)
+            model_type = 'batting_models' if is_batter else 'pitching_models'
+            model_dict = getattr(self, model_type, {})
+            
+            for metric, models in model_dict.items():
+                # Skip IP prediction for pitchers
+                if metric == 'IP' and is_pitcher:
+                    prediction_result['prediction'][metric] = player_stats.get('IP', 0) / player_stats.get('games', 1)
+                    prediction_result['confidence'][metric] = (
+                        prediction_result['prediction'][metric] * 0.7,
+                        prediction_result['prediction'][metric] * 1.3
+                    )
+                    continue
                 
-            elif is_pitcher:
-
-                # Use pitching models to make predictions
-                for metric, model in self.pitching_models.items():
-                    if isinstance(model, dict):
-                        # Choose which model type to use (for example, 'ensemble')
-                        if 'ensemble' in model:
-                            model_to_use = model['ensemble']
-                        elif 'stacking' in model:
-                            model_to_use = model['stacking']
-                        elif 'nn' in model:
-                            model_to_use = model['nn']
-                        else:
-                            model_to_use = list(model.values())[0]  # Use first available model
-                    else:
-                        model_to_use = model
-                    # Skip if the metric is the same as the feature
-                    if metric == 'IP':
-                        prediction_result['prediction'][metric] = player_stats.get('IP', 0) / player_stats.get('games', 1)
-                        prediction_result['confidence'][metric] = (
-                            prediction_result['prediction'][metric] * 0.7, 
-                            prediction_result['prediction'][metric] * 1.3
-                        )
-                        continue
+                # Get appropriate model for this metric
+                model = self.get_prediction_model(models, metric)
+                
+                # Create feature DataFrame
+                features = pd.DataFrame([features_dict])
+                
+                # Match features to model requirements
+                features = self.match_features_to_model(features, model)
+                
+                # Make prediction
+                try:
+                    prediction = model.predict(features)[0]
                     
-                    # Create feature vector for prediction
-                    features_dict = {
-                        'IP': player_stats.get('IP', 0) / max(player_stats.get('games', 1), 1),
-                        'H': player_stats.get('H', 0) / max(player_stats.get('games', 1), 1),
-                        'R': player_stats.get('R', 0) / max(player_stats.get('games', 1), 1),
-                        'ER': player_stats.get('ER', 0) / max(player_stats.get('games', 1), 1),
-                        'SO': player_stats.get('SO', 0) / max(player_stats.get('games', 1), 1),
-                        'BB': player_stats.get('BB', 0) / max(player_stats.get('games', 1), 1),
-                        'HR': player_stats.get('HR', 0) / max(player_stats.get('games', 1), 1),
-                        'GB': player_stats.get('GB', 0) / max(player_stats.get('games', 1), 1),
-                        'FB': player_stats.get('FB', 0) / max(player_stats.get('games', 1), 1),
-                        'Str': player_stats.get('Str', 0) / max(player_stats.get('games', 1), 1),
-                        'Pit': player_stats.get('Pit', 0) / max(player_stats.get('games', 1), 1),
-                        'BF': player_stats.get('BF', 0) / max(player_stats.get('games', 1), 1),
-                        'ERA': player_stats.get('ERA', 0),
-                        'WHIP': player_stats.get('WHIP', 0),
-                        'Home_True': 1 if is_home_game else 0
-                    }
-
-                    # Calculate derived metrics
-                    ip = max(player_stats.get('IP', 0), 0.1)
-                    pit = max(player_stats.get('Pit', 0), 1)
-                    fb = max(player_stats.get('FB', 0), 1)
-
-                    features_dict['K_per_9'] = 9 * player_stats.get('SO', 0) / ip
-                    features_dict['BB_per_9'] = 9 * player_stats.get('BB', 0) / ip
-                    features_dict['HR_per_9'] = 9 * player_stats.get('HR', 0) / ip
-                    features_dict['Str_pct'] = player_stats.get('Str', 0) / pit
-                    features_dict['GB_FB_ratio'] = player_stats.get('GB', 0) / fb
-
-
-                    # Handle missing features based on model requirements
-                    if hasattr(model_to_use, 'feature_names_in_'):
-                        required_features = model_to_use.feature_names_in_
-                        features = pd.DataFrame([features_dict])
-                        
-                        # Add any missing features with default value 0
-                        for feature in required_features:
-                            if feature not in features.columns:
-                                features[feature] = 0
-                                
-                        # Ensure correct column order
-                        features = features[required_features]
-                    else:
-                        features = pd.DataFrame([features_dict])
-
-                    #self.logger.info(f"Using model type: {type(self.pitching_models[metric])}")
-                    # Make prediction
-                    prediction = model_to_use.predict(features)[0]
+                    # Convert numpy types to Python types
+                    if isinstance(prediction, (np.integer, np.floating)):
+                        prediction = float(prediction)
                     
-                    # Calculate confidence interval (using model's standard deviation)
-                    std_dev = np.std(model_to_use.predict(features))
-                    lower_bound = max(0, prediction - 1.96 * std_dev)
-                    upper_bound = prediction + 1.96 * std_dev
+                    # Calculate confidence interval
+                    confidence_interval = self.calculate_confidence_interval(prediction, model, features)
                     
                     # Store prediction and confidence interval
                     prediction_result['prediction'][metric] = prediction
-                    prediction_result['confidence'][metric] = (lower_bound, upper_bound)
+                    prediction_result['confidence'][metric] = confidence_interval
+                    
+                except Exception as e:
+                    self.logger.warning(f"Error predicting {metric} for {player_name}: {e}")
+            
+            # Add metadata for debugging and analysis
+            prediction_result['metadata'] = {
+                'player': player_name,
+                'team': player_team,
+                'position': 'batter' if is_batter else 'pitcher',
+                'game_date': target_date,
+                'is_home': is_home_game,
+                'opponent': opponent,
+                'sample_size': player_stats.get('games', 0)
+            }
             
             return prediction_result
             
         except Exception as e:
             self.logger.error(f"Error predicting player performance for {player_name}: {e}")
-            return {'prediction': {}, 'confidence': {}}
+            return {'prediction': {}, 'confidence': {}, 'error': str(e)}
     
-    def predict_game_winner(self, home_team: str, away_team: str, 
-                    target_date: str) -> Dict[str, float]:
+    def get_head_to_head_stats(self, home_team: str, away_team: str, target_date: str) -> Dict[str, float]:
         """
-        Predict the winner of an upcoming game using team-specific models.
+        Get head-to-head statistics between two teams up to a specific date.
+        
+        Args:
+            home_team (str): Name of the home team
+            away_team (str): Name of the away team
+            target_date (str): The reference date for retrieving historical data
+            
+        Returns:
+            Dict[str, float]: Dictionary containing head-to-head statistics
+        """
+        try:
+            target_date = pd.to_datetime(target_date)
+            
+            # Filter linescore data to include only games before the target date
+            filtered_linescore = self.linescore_data[self.linescore_data['Date'] < target_date]
+            
+            # Initialize head-to-head stats
+            home_wins = 0
+            away_wins = 0
+            home_runs_scored = 0
+            away_runs_scored = 0
+            recent_games = []  # To track most recent matchups (more weight)
+            
+            # Process the linescore data two rows at a time
+            i = 0
+            while i < len(filtered_linescore) - 1:
+                try:
+                    # Get the away team row and home team row
+                    away_row = filtered_linescore.iloc[i]
+                    home_row = filtered_linescore.iloc[i+1]
+                    
+                    # Verify that these rows are for the same game
+                    if away_row['Date'] != home_row['Date'] or away_row['AwayTeam'] != home_row['AwayTeam'] or away_row['HomeTeam'] != home_row['HomeTeam']:
+                        # These rows don't represent the same game, skip to next row
+                        i += 1
+                        continue
+                    
+                    # Check if this is a game between the two teams we're interested in
+                    is_matchup = (
+                        (home_row['HomeTeam'] == home_team and away_row['AwayTeam'] == away_team) or
+                        (home_row['HomeTeam'] == away_team and away_row['AwayTeam'] == home_team)
+                    )
+                    
+                    if is_matchup:
+                        game_date = home_row['Date']
+                        curr_home_team = home_row['HomeTeam']
+                        curr_away_team = away_row['AwayTeam']
+                        
+                        # Get the scores
+                        try:
+                            away_runs = float(away_row.get('R', 0))
+                            home_runs = float(home_row.get('R', 0))
+                            
+                            # Store the matchup result
+                            result = {
+                                'date': game_date,
+                                'home_team': curr_home_team,
+                                'away_team': curr_away_team,
+                                'home_runs': home_runs,
+                                'away_runs': away_runs,
+                                'home_win': home_runs > away_runs
+                            }
+                            recent_games.append(result)
+                            
+                            # Update stats based on which team was home
+                            if curr_home_team == home_team and curr_away_team == away_team:
+                                # Regular orientation (home_team at home)
+                                if home_runs > away_runs:
+                                    home_wins += 1
+                                else:
+                                    away_wins += 1
+                                home_runs_scored += home_runs
+                                away_runs_scored += away_runs
+                            else:
+                                # Reverse orientation (home_team was away)
+                                if home_runs > away_runs:
+                                    away_wins += 1
+                                else:
+                                    home_wins += 1
+                                home_runs_scored += away_runs
+                                away_runs_scored += home_runs
+                        except (ValueError, TypeError) as e:
+                            self.logger.warning(f"Error processing H2H game scores: {e}")
+                    
+                    # Move to the next game (skip two rows)
+                    i += 2
+                    
+                except Exception as e:
+                    self.logger.warning(f"Error processing game at index {i}: {e}")
+                    i += 1  # Move to next row if there's an error
+            
+            # Calculate statistics
+            total_games = home_wins + away_wins
+            home_win_pct = home_wins / total_games if total_games > 0 else 0.5
+            
+            # Calculate run differential
+            home_rpg = home_runs_scored / total_games if total_games > 0 else 0
+            away_rpg = away_runs_scored / total_games if total_games > 0 else 0
+            
+            # Calculate recency-weighted win percentage (more weight to recent games)
+            # Sort games by date
+            recent_games.sort(key=lambda x: x['date'])
+            
+            # Calculate weighted win percentage if we have games
+            weighted_home_wins = 0
+            total_weight = 0
+            
+            for i, game in enumerate(recent_games):
+                # Exponential weight based on recency
+                weight = 1.5 ** i  # More recent games get higher weight
+                total_weight += weight
+                
+                # Check if home team won (accounting for possible venue switch)
+                home_team_won = (
+                    (game['home_team'] == home_team and game['home_win']) or
+                    (game['away_team'] == home_team and not game['home_win'])
+                )
+                
+                if home_team_won:
+                    weighted_home_wins += weight
+            
+            # Calculate weighted win percentage
+            weighted_home_win_pct = weighted_home_wins / total_weight if total_weight > 0 else 0.5
+            
+            # Blend regular and weighted win percentages, favoring weighted if we have enough games
+            blended_win_pct = home_win_pct
+            if total_games >= 5:
+                recency_weight = min(0.7, 0.3 + (total_games / 20) * 0.4)  # 30% for 5 games, up to 70% for 20+ games
+                blended_win_pct = (home_win_pct * (1 - recency_weight)) + (weighted_home_win_pct * recency_weight)
+            
+            return {
+                'home_wins': home_wins,
+                'away_wins': away_wins,
+                'total_games': total_games,
+                'home_win_pct': home_win_pct,
+                'weighted_home_win_pct': weighted_home_win_pct,
+                'blended_win_pct': blended_win_pct,
+                'home_rpg': home_rpg,
+                'away_rpg': away_rpg,
+                'run_differential': home_rpg - away_rpg,
+                'recent_games': recent_games[-5:] if recent_games else []  # Include last 5 games
+            }
+                
+        except Exception as e:
+            self.logger.error(f"Error getting head-to-head stats for {home_team} vs {away_team}: {e}")
+            return {'home_win_pct': 0.5, 'total_games': 0}
+        
+    def get_best_team_model(self, team: str):
+        """
+        Select the best available model for a team, with fallbacks.
+        
+        Args:
+            team (str): Team name to find a model for
+            
+        Returns:
+            Model object or None if no suitable model found
+        """
+        # Direct match
+        if team in self.team_models:
+            self.logger.info(f"Using exact match model for {team}")
+            return self.team_models[team]
+        
+        # Try partial name matching
+        for model_team in self.team_models:
+            if team in model_team or model_team in team:
+                self.logger.info(f"Using partial match model for {team} (matched with {model_team})")
+                return self.team_models[model_team]
+        
+        # Try league average model as fallback
+        if 'league_average' in self.team_models:
+            self.logger.info(f"Using league average model for {team} (no specific model found)")
+            return self.team_models['league_average']
+        
+        # If no suitable model found, return None
+        self.logger.warning(f"No suitable model found for {team}")
+        return None
+    
+    def calculate_momentum_factor(self, team_name: str, target_date: str) -> float:
+        """
+        Calculate a momentum factor based on recent performance.
+        
+        Args:
+            team_name (str): Name of the team
+            target_date (str): Target date for prediction
+            
+        Returns:
+            float: Momentum factor (1.0 is neutral, higher values mean positive momentum)
+        """
+        momentum = 1.0
+        
+        # Use team streaks if available
+        if hasattr(self, 'team_streaks') and team_name in self.team_streaks:
+            win_streak = self.team_streaks[team_name].get('win_streak', 0)
+            recent_form = self.team_streaks[team_name].get('recent_win_pct', 0.5)
+            
+            # Adjust for win streak (capped at 0.1 adjustment)
+            streak_factor = min(0.1, win_streak * 0.02)
+            
+            # Adjust for recent form (difference from 0.5)
+            form_factor = (recent_form - 0.5) * 0.2
+            
+            momentum += streak_factor + form_factor
+        
+        # Calculate run differentials over last N games if available
+        if hasattr(self, 'team_records') and team_name in self.team_records.index:
+            run_diff = self.team_records.loc[team_name, 'run_differential']
+            run_diff_per_game = run_diff / max(1, self.team_records.loc[team_name, 'Wins'] + self.team_records.loc[team_name, 'Losses'])
+            
+            # Add small adjustment based on run differential
+            if abs(run_diff_per_game) > 0.5:
+                run_diff_factor = min(0.1, abs(run_diff_per_game) * 0.02) * (1 if run_diff_per_game > 0 else -1)
+                momentum += run_diff_factor
+        
+        return momentum
+
+    def calculate_prediction_confidence(self, home_win_prob: float, model_count: int, 
+                               h2h_games: int, total_games: int) -> str:
+        """
+        Calculate prediction confidence level based on multiple factors.
+        
+        Args:
+            home_win_prob (float): Predicted home win probability
+            model_count (int): Number of models used for prediction
+            h2h_games (int): Number of head-to-head games in history
+            total_games (int): Total games played this season
+            
+        Returns:
+            str: Confidence level description
+        """
+        # Base confidence on deviation from 50%
+        prob_confidence = abs(home_win_prob - 0.5)
+        
+        # Scale based on number of models used
+        model_factor = min(1.0, model_count / 2)
+        
+        # Scale based on head-to-head history
+        h2h_factor = min(1.0, h2h_games / 10)
+        
+        # Scale based on total games played this season
+        season_factor = min(1.0, total_games / 40)
+        
+        # Calculate weighted confidence score
+        confidence_score = (
+            prob_confidence * 0.5 +
+            model_factor * 0.2 + 
+            h2h_factor * 0.2 +
+            season_factor * 0.1
+        )
+        
+        # Convert to confidence levels
+        if confidence_score < 0.15:
+            return "low"
+        elif confidence_score < 0.3:
+            return "medium-low"
+        elif confidence_score < 0.45:
+            return "medium"
+        elif confidence_score < 0.6:
+            return "medium-high"
+        else:
+            return "high"
+        
+    def generate_prediction_explanation(self, home_team: str, away_team: str, 
+                                   home_win_prob: float, h2h_stats: Dict) -> str:
+        """
+        Generate human-readable explanation for the prediction.
+        
+        Args:
+            home_team (str): Home team name
+            away_team (str): Away team name
+            home_win_prob (float): Predicted home win probability
+            h2h_stats (Dict): Head-to-head statistics dictionary
+            
+        Returns:
+            str: Explanation of prediction factors
+        """
+        explanation = []
+        
+        # Basic win probability statement
+        win_pct = home_win_prob * 100
+        if win_pct > 50:
+            explanation.append(f"{home_team} has a {win_pct:.1f}% chance to win at home against {away_team}.")
+        else:
+            explanation.append(f"{away_team} has a {(100-win_pct):.1f}% chance to win on the road against {home_team}.")
+        
+        # Add head-to-head context
+        h2h_games = h2h_stats.get('total_games', 0)
+        if h2h_games >= 3:
+            h2h_win_pct = h2h_stats.get('home_win_pct', 0.5) * 100
+            explanation.append(f"In {h2h_games} previous matchups, {home_team} has won {h2h_win_pct:.1f}% of games against {away_team}.")
+        
+        # Add team form context
+        if hasattr(self, 'team_streaks'):
+            home_streak = self.team_streaks.get(home_team, {}).get('win_streak', 0)
+            away_streak = self.team_streaks.get(away_team, {}).get('win_streak', 0)
+            
+            if home_streak > 2:
+                explanation.append(f"{home_team} is on a {home_streak}-game winning streak.")
+            elif home_streak == 0:
+                explanation.append(f"{home_team} has not won their last game.")
+                
+            if away_streak > 2:
+                explanation.append(f"{away_team} is on a {away_streak}-game winning streak.")
+            elif away_streak == 0:
+                explanation.append(f"{away_team} has not won their last game.")
+        
+        # Add team stat comparison if available
+        if hasattr(self, 'team_records'):
+            if home_team in self.team_records.index and away_team in self.team_records.index:
+                home_win_pct = self.team_records.loc[home_team, 'WinPct'] * 100
+                away_win_pct = self.team_records.loc[away_team, 'WinPct'] * 100
+                
+                if abs(home_win_pct - away_win_pct) > 10:
+                    better_team = home_team if home_win_pct > away_win_pct else away_team
+                    worse_team = away_team if home_win_pct > away_win_pct else home_team
+                    win_diff = abs(home_win_pct - away_win_pct)
+                    explanation.append(f"{better_team} has a {win_diff:.1f}% better overall win percentage than {worse_team}.")
+        
+        return " ".join(explanation)
+ 
+    def predict_game_winner(self, home_team: str, away_team: str, 
+            target_date: str) -> Dict[str, float]:
+        """
+        Predict the winner of an upcoming game using team-specific models with enhanced features.
+        
+        Args:
+            home_team (str): Name of the home team
+            away_team (str): Name of the away team
+            target_date (str): The date of the game to predict
+            
+        Returns:
+            Dict: Enhanced prediction results with detailed information
         """
         try:
             # Get team statistics
             home_team_stats = self.get_team_stats(home_team, target_date)
             away_team_stats = self.get_team_stats(away_team, target_date)
             
+            # Get head-to-head statistics up to the target date
+            self.h2h_stats = self.get_head_to_head_stats(home_team, away_team, target_date)
+            
             if not home_team_stats or not away_team_stats:
                 self.logger.warning(f"Missing team stats for {home_team} or {away_team}")
                 return {
                     'home_win_probability': 0.5,
                     'away_win_probability': 0.5,
-                    'confidence': 'low'
+                    'confidence': 'low',
+                    'predicted_winner': home_team if random.random() > 0.5 else away_team
                 }
             
-            # Create feature vectors for both team perspectives
+            # Create enhanced feature vectors with all available metrics
             home_features = pd.DataFrame({
+                # Basic team stats
                 'TeamWinPct': [home_team_stats.get('win_pct', 0)],
                 'OpponentWinPct': [away_team_stats.get('win_pct', 0)],
                 'IsHome': [1],
                 'HomeTeamHomeWinPct': [home_team_stats.get('home_win_pct', 0)],
-                'AwayTeamAwayWinPct': [away_team_stats.get('away_win_pct', 0)]
+                'AwayTeamAwayWinPct': [away_team_stats.get('away_win_pct', 0)],
+                
+                # Head-to-head metrics
+                'H2HWinPct': [self.h2h_stats.get('blended_win_pct', 0.5)],
+                'H2HGameCount': [self.h2h_stats.get('total_games', 0)],
+                'H2HRunDiff': [self.h2h_stats.get('run_differential', 0)],
+                
+                # Run production/prevention
+                'RunsPerGame': [home_team_stats.get('rpg', 0)],
+                'RunsAllowedPerGame': [home_team_stats.get('rapg', 0)],
+                'RunDifferential': [home_team_stats.get('run_differential', 0)],
+                
+                # Team streaks if available
+                'WinStreak': [self.team_streaks.get(home_team, {}).get('win_streak', 0) if hasattr(self, 'team_streaks') else 0],
+                'RecentForm': [self.team_streaks.get(home_team, {}).get('recent_win_pct', 0.5) if hasattr(self, 'team_streaks') else 0.5],
+                
+                # Ballpark factor
+                'BallparkFactor': [self.ballpark_factors.get(home_team, 1.0) if hasattr(self, 'ballpark_factors') else 1.0]
             })
             
+            # Create similar enhanced feature vector for away team
             away_features = pd.DataFrame({
                 'TeamWinPct': [away_team_stats.get('win_pct', 0)],
                 'OpponentWinPct': [home_team_stats.get('win_pct', 0)],
                 'IsHome': [0],
                 'HomeTeamHomeWinPct': [home_team_stats.get('home_win_pct', 0)],
-                'AwayTeamAwayWinPct': [away_team_stats.get('away_win_pct', 0)]
+                'AwayTeamAwayWinPct': [away_team_stats.get('away_win_pct', 0)],
+                'H2HWinPct': [1 - self.h2h_stats.get('blended_win_pct', 0.5)],
+                'H2HGameCount': [self.h2h_stats.get('total_games', 0)],
+                'H2HRunDiff': [-self.h2h_stats.get('run_differential', 0)],
+                'RunsPerGame': [away_team_stats.get('rpg', 0)],
+                'RunsAllowedPerGame': [away_team_stats.get('rapg', 0)],
+                'RunDifferential': [away_team_stats.get('run_differential', 0)],
+                'WinStreak': [self.team_streaks.get(away_team, {}).get('win_streak', 0) if hasattr(self, 'team_streaks') else 0],
+                'RecentForm': [self.team_streaks.get(away_team, {}).get('recent_win_pct', 0.5) if hasattr(self, 'team_streaks') else 0.5],
+                'BallparkFactor': [self.ballpark_factors.get(home_team, 1.0) if hasattr(self, 'ballpark_factors') else 1.0]
             })
             
-            # Make predictions using team-specific models if available
+            # Get best models for home and away teams
+            home_model = self.get_best_team_model(home_team)
+            away_model = self.get_best_team_model(away_team)
+            
+            # Initialize win probability arrays and model tracking
             home_win_probs = []
-            away_win_probs = []
+            model_weights = []
+            used_models = []
             
             # Use home team model if available
-            if home_team in self.team_models:
-                home_model = self.team_models[home_team]
-                home_team_win_prob = home_model.predict_proba(home_features)[0][1]
-                home_win_probs.append(home_team_win_prob)
-
-            else:# Try to find a model where the team_name is a substring
-                for model_team in self.team_models:
-                    if home_team in model_team or model_team in home_team:
-                        home_model = self.team_models[model_team]
-                        home_team_win_prob = home_model.predict_proba(home_features)[0][1]
-                        home_win_probs.append(home_team_win_prob)
-                
-            # Use away team model if available
-            if away_team in self.team_models:
-                away_model = self.team_models[away_team]
-                away_team_win_prob = away_model.predict_proba(away_features)[0][1]
-                away_win_probs.append(1 - away_team_win_prob)  # Convert to home win prob
-            else:# Try to find a model where the team_name is a substring
-                for model_team in self.team_models:
-                    if away_team in model_team or model_team in away_team:
-                        away_model = self.team_models[model_team]
-                        away_team_win_prob = away_model.predict_proba(away_features)[0][1]
-                        away_win_probs.append(1 - away_team_win_prob)  # Convert to home win prob
-            
-            # Combine predictions if we have both
-            if home_win_probs and away_win_probs:
-                # Average the predictions (could use weighted average based on model confidence)
-                home_win_prob = (sum(home_win_probs) + sum(away_win_probs)) / (len(home_win_probs) + len(away_win_probs))
-                confidence = 'medium'
-            elif home_win_probs:
-                home_win_prob = home_win_probs[0]
-                confidence = 'medium-low'
-            elif away_win_probs:
-                home_win_prob = away_win_probs[0]
-                confidence = 'medium-low'
-            else:
-                # No models available, use simple heuristic
-                self.logger.info(f"No team models available for {home_team} vs {away_team}, using heuristic")
-                home_factor = home_team_stats.get('home_win_pct', 0) * 2
-                away_factor = away_team_stats.get('away_win_pct', 0) * 1.5
-                
-                total_factor = home_factor + away_factor
-                if total_factor == 0:
-                    home_win_prob = 0.5  # 50-50 if no data
-                else:
-                    home_win_prob = home_factor / total_factor
+            if home_model:
+                try:
+                    # Need to ensure features match what the model expects
+                    home_team_win_prob = home_model.predict_proba(home_features)[0][1]
+                    home_win_probs.append(home_team_win_prob)
                     
-                confidence = 'low'
+                    # Weight based on model quality
+                    model_weight = 1.0
+                    if home_team in self.team_models:  # Exact match gets higher weight
+                        model_weight = 1.5
+                    model_weights.append(model_weight)
+                    used_models.append(f"home_{home_team}")
+                    
+                    self.logger.info(f"Home team model predicts: {home_team_win_prob:.4f}")
+                except Exception as e:
+                    self.logger.warning(f"Error using home team model: {e}")
             
-            # Determine confidence level based on probability range (if not set above)
-            if confidence != 'low' and confidence != 'medium-low':
-                if 0.4 <= home_win_prob <= 0.6:
-                    confidence = 'medium'
-                elif 0.3 <= home_win_prob < 0.4 or 0.6 < home_win_prob <= 0.7:
-                    confidence = 'medium-high'
-                else:
-                    confidence = 'high'
+            # Use away team model if available
+            if away_model:
+                try:
+                    away_team_win_prob = away_model.predict_proba(away_features)[0][1]
+                    # Convert to home win probability
+                    away_home_win_prob = 1 - away_team_win_prob
+                    home_win_probs.append(away_home_win_prob)
+                    
+                    # Weight based on model quality
+                    model_weight = 1.0
+                    if away_team in self.team_models:  # Exact match gets higher weight
+                        model_weight = 1.5
+                    model_weights.append(model_weight)
+                    used_models.append(f"away_{away_team}")
+                    
+                    self.logger.info(f"Away team model predicts: {away_home_win_prob:.4f}")
+                except Exception as e:
+                    self.logger.warning(f"Error using away team model: {e}")
             
+            # Apply momentum adjustments
+            home_momentum = self.calculate_momentum_factor(home_team, target_date)
+            away_momentum = self.calculate_momentum_factor(away_team, target_date)
+            momentum_advantage = home_momentum - away_momentum
+            
+            # Calculate head-to-head adjustment
+            h2h_adjustment = 0
+            h2h_games = self.h2h_stats.get('total_games', 0)
+            
+            if h2h_games >= 3:
+                h2h_win_pct = self.h2h_stats.get('blended_win_pct', 0.5)
+                h2h_advantage = h2h_win_pct - 0.5
+                
+                # Adjustment strength increases with more games but caps at a certain level
+                h2h_weight = min(0.2, 0.05 + (h2h_games / 30) * 0.15)
+                h2h_adjustment = h2h_advantage * h2h_weight
+                
+                self.logger.info(f"H2H adjustment: {h2h_adjustment:.4f} (based on {h2h_games} games)")
+            
+            # Calculate final win probability
+            if home_win_probs:
+                # Calculate weighted average of model predictions
+                base_home_win_prob = sum(p * w for p, w in zip(home_win_probs, model_weights)) / sum(model_weights)
+                
+                # Apply momentum and head-to-head adjustments
+                adjusted_home_win_prob = base_home_win_prob
+                adjusted_home_win_prob += momentum_advantage * 0.05  # Scale momentum effect
+                adjusted_home_win_prob += h2h_adjustment
+                
+                # Ensure probability stays in valid range
+                home_win_prob = min(0.95, max(0.05, adjusted_home_win_prob))
+            else:
+                # Fallback if no models available - use head-to-head and momentum
+                self.logger.info("No team models available, using heuristic")
+                
+                # Start with neutral probability and apply adjustments
+                home_win_prob = 0.54  # Slight home field advantage
+                
+                # Apply head-to-head adjustment
+                if h2h_games >= 3:
+                    home_win_prob = (home_win_prob * 0.7) + (self.h2h_stats.get('blended_win_pct', 0.5) * 0.3)
+                
+                # Apply momentum adjustment
+                home_win_prob += momentum_advantage * 0.05
+                
+                # Apply win percentage difference
+                win_pct_diff = home_team_stats.get('win_pct', 0.5) - away_team_stats.get('win_pct', 0.5)
+                home_win_prob += win_pct_diff * 0.2
+                
+                # Apply home/away record adjustment
+                home_home_advantage = home_team_stats.get('home_win_pct', 0.5) - 0.5
+                away_road_disadvantage = 0.5 - away_team_stats.get('away_win_pct', 0.5)
+                home_win_prob += (home_home_advantage + away_road_disadvantage) * 0.1
+                
+                # Ensure probability stays in valid range
+                home_win_prob = min(0.95, max(0.05, home_win_prob))
+            
+            # Determine predicted winner
+            predicted_winner = home_team if home_win_prob > 0.5 else away_team
+            win_probability = home_win_prob if predicted_winner == home_team else (1 - home_win_prob)
+            
+            # Calculate win margin estimation based on win probability
+            probability_diff = abs(home_win_prob - 0.5)
+            base_margin = probability_diff * 6  # 6 runs for a 100% certain win
+            run_diff_component = abs(home_team_stats.get('run_differential', 0) - away_team_stats.get('run_differential', 0)) / 10
+            estimated_margin = max(1, (base_margin + run_diff_component))
+            
+            if home_win_prob > 0.5:
+                win_margin = estimated_margin
+            else:
+                win_margin = -estimated_margin
+                
+            # Calculate confidence
+            confidence_level = self.calculate_prediction_confidence(
+                home_win_prob, 
+                len(home_win_probs),
+                h2h_games,
+                home_team_stats.get('wins', 0) + home_team_stats.get('losses', 0)
+            )
+            
+            # Generate natural language explanation
+            explanation = self.generate_prediction_explanation(
+                home_team, away_team, home_win_prob, self.h2h_stats
+            )
+            
+            # Return enhanced prediction results
             return {
                 'home_win_probability': home_win_prob,
                 'away_win_probability': 1 - home_win_prob,
-                'confidence': confidence
+                'predicted_winner': predicted_winner,
+                'win_probability': win_probability,
+                'win_margin': win_margin,
+                'confidence': confidence_level,
+                'h2h_stats': self.h2h_stats,
+                'team_form': {
+                    'home_team': {
+                        'win_streak': self.team_streaks.get(home_team, {}).get('win_streak', 0) if hasattr(self, 'team_streaks') else 0,
+                        'recent_form': self.team_streaks.get(home_team, {}).get('recent_win_pct', 0.5) if hasattr(self, 'team_streaks') else 0.5
+                    },
+                    'away_team': {
+                        'win_streak': self.team_streaks.get(away_team, {}).get('win_streak', 0) if hasattr(self, 'team_streaks') else 0,
+                        'recent_form': self.team_streaks.get(away_team, {}).get('recent_win_pct', 0.5) if hasattr(self, 'team_streaks') else 0.5
+                    }
+                },
+                'explanation': explanation,
+                'model_contributions': {
+                    'models_used': used_models,
+                    'base_prediction': base_home_win_prob if home_win_probs else None,
+                    'momentum_adjustment': momentum_advantage * 0.05,
+                    'h2h_adjustment': h2h_adjustment,
+                    'home_momentum': home_momentum,
+                    'away_momentum': away_momentum
+                }
             }
             
         except Exception as e:
@@ -1432,237 +2123,429 @@ class BaseballPredictor:
             return {
                 'home_win_probability': 0.5,
                 'away_win_probability': 0.5,
-                'confidence': 'low'
+                'predicted_winner': home_team if random.random() > 0.5 else away_team,
+                'confidence': 'low',
+                'error': str(e)
             }
     
-    def analyze_game_outcome(self, game_prediction: Dict[str, any], 
-                        home_players: List[Dict], away_players: List[Dict],
-                        home_team: str, away_team: str) -> Dict[str, any]:
-        """
-        Analyze game outcome based on detailed player projections.
+    def _extract_batting_data(self, batters):
+        """Extract normalized batting data from player predictions"""
+        batting_data = []
+        for player in batters:
+            if 'player_name' not in player:
+                continue
+                
+            row = {
+                'name': player['player_name'],
+                'position': player.get('position', 'Unknown'),
+                'order': player.get('batting_order', 0),
+                'R': player.get('pred_R', 0),
+                'H': player.get('pred_H', 0),
+                'RBI': player.get('pred_RBI', 0),
+                'HR': player.get('pred_HR', 0),
+                'AVG': player.get('pred_AVG', 0),
+                'OBP': player.get('pred_OBP', 0)
+            }
+            batting_data.append(row)
+        return batting_data
+
+    def _extract_pitching_data(self, pitchers):
+        """Extract normalized pitching data from player predictions"""
+        pitching_data = []
+        for player in pitchers:
+            if 'player_name' not in player:
+                continue
+                
+            row = {
+                'name': player['player_name'],
+                'IP': player.get('pred_IP', 0),
+                'H': player.get('pred_H', 0),
+                'R': player.get('pred_R', 0),
+                'ER': player.get('pred_ER', 0),
+                'ERA': player.get('pred_ERA', 0),
+                'WHIP': player.get('pred_WHIP', 0),
+                'SO': player.get('pred_SO', 0),
+                'BB': player.get('pred_BB', 0)
+            }
+            pitching_data.append(row)
+        return pitching_data
+
+    def _calculate_expected_runs(self, batting_data, opposing_pitching_data):
+        """Calculate expected runs with weighted contributions"""
+        # Direct contributions
+        direct_runs = sum(player.get('R', 0) for player in batting_data)
         
-        This function creates dataframes of projected batting and pitching stats,
-        calculates expected run differentials, and compares with the team model
-        prediction to determine the most likely winner.
+        # Add production from RBIs (with compensation for double-counting)
+        rbi_component = 0.7 * sum(player.get('RBI', 0) for player in batting_data)
+        
+        # Add HR contribution (already in R and RBI but helps model accuracy)
+        hr_component = 0.2 * sum(player.get('HR', 0) for player in batting_data)
+        
+        # Base expected runs
+        expected_runs = (direct_runs + rbi_component + hr_component) / 3
+        
+        # Adjust for opposing pitching quality
+        pitching_factor = 1.0
+        if opposing_pitching_data:
+            ip_values = [p.get('IP', 0) for p in opposing_pitching_data]
+            era_values = [p.get('ERA', 0) for p in opposing_pitching_data if p.get('ERA', 0) > 0]
+            
+            if era_values and sum(ip_values) > 0:
+                # Weight ERA by IP
+                weighted_era = sum(era * ip for era, ip in zip(era_values, ip_values)) / sum(ip_values)
+                # League average ERA is around 4.00
+                pitching_factor = weighted_era / 4.00
+                
+                # Cap adjustment factor
+                pitching_factor = max(0.7, min(1.3, pitching_factor))
+        
+        # Apply pitching adjustment
+        expected_runs *= pitching_factor
+        
+        return expected_runs
+    
+    def _calculate_matchup_factors(self, home_team, away_team, home_pitching, away_pitching, 
+                             home_batting, away_batting):
+        """Calculate team-specific matchup adjustments"""
+        matchup_factors = {}
+        
+        # Power vs. Strikeout pitchers (home batting vs away pitching)
+        home_power = sum(p.get('HR', 0) for p in home_batting) / max(1, len(home_batting))
+        away_strikeouts = 0
+        
+        if away_pitching:
+            # Extract strikeout tendency
+            so_values = [p.get('SO', 0) for p in away_pitching]
+            ip_values = [p.get('IP', 0) for p in away_pitching]
+            
+            if so_values and sum(ip_values) > 0:
+                # Calculate K/9
+                away_strikeouts = sum(so_values) * 9 / sum(ip_values)
+        
+        # High HR + low K = advantage for home
+        power_vs_k_factor = 1 + min(0.1, max(-0.1, (home_power - 0.1) * (1 - (away_strikeouts / 9)) * 0.3))
+        matchup_factors['home_power_vs_away_k'] = power_vs_k_factor
+        
+        # Same for away team
+        away_power = sum(p.get('HR', 0) for p in away_batting) / max(1, len(away_batting))
+        home_strikeouts = 0
+        
+        if home_pitching:
+            so_values = [p.get('SO', 0) for p in home_pitching]
+            ip_values = [p.get('IP', 0) for p in home_pitching]
+            
+            if so_values and sum(ip_values) > 0:
+                home_strikeouts = sum(so_values) * 9 / sum(ip_values)
+        
+        power_vs_k_factor = 1 + min(0.1, max(-0.1, (away_power - 0.1) * (1 - (home_strikeouts / 9)) * 0.3))
+        matchup_factors['away_power_vs_home_k'] = power_vs_k_factor
+        
+        return matchup_factors
+    
+    def _identify_key_contributors(self, home_batting, away_batting, home_pitching, away_pitching):
+        """Identify key contributors to the expected outcome"""
+        key_contributors = {'home': [], 'away': []}
+        
+        # Find top batters by combined R+RBI+HR
+        for team, data in [('home', home_batting), ('away', away_batting)]:
+            for player in data:
+                contribution = player.get('R', 0) + player.get('RBI', 0) + (player.get('HR', 0) * 1.5)
+                if contribution > 0:
+                    key_contributors[team].append({
+                        'name': player['name'],
+                        'value': contribution,
+                        'metric': 'R+RBI+HR',
+                        'type': 'batter'
+                    })
+        
+        # Find top pitchers by IP and low ERA
+        for team, data in [('home', home_pitching), ('away', away_pitching)]:
+            for player in data:
+                ip = player.get('IP', 0)
+                era = player.get('ERA', 5.0)
+                if ip > 0:
+                    # Lower ERA is better, so invert for contribution
+                    contribution = ip * (6.0 - min(6.0, era)) / 2
+                    key_contributors[team].append({
+                        'name': player['name'],
+                        'value': contribution,
+                        'metric': 'IP/ERA',
+                        'type': 'pitcher'
+                    })
+        
+        # Sort contributors by value
+        for team in key_contributors:
+            key_contributors[team] = sorted(key_contributors[team], key=lambda x: x['value'], reverse=True)[:3]
+        
+        return key_contributors
+    
+    def _calculate_confidence_score(self, team_model_confidence, model_agreement, player_data_quality):
+        """Calculate an integrated confidence score for game prediction"""
+        # Base confidence from team model
+        confidence_map = {
+            'low': 0.3,
+            'medium-low': 0.4,
+            'medium': 0.5,
+            'medium-high': 0.7,
+            'high': 0.9
+        }
+        
+        confidence = confidence_map.get(team_model_confidence, 0.5)
+        
+        # Adjust for model agreement
+        if model_agreement:
+            confidence *= 1.2
+        else:
+            confidence *= 0.8
+        
+        # Adjust for player data quality
+        confidence *= player_data_quality
+        
+        # Ensure confidence is in valid range
+        confidence = max(0.1, min(1.0, confidence))
+        
+        # Map back to descriptive confidence
+        if confidence < 0.35:
+            return 'low'
+        elif confidence < 0.45:
+            return 'medium-low'
+        elif confidence < 0.65:
+            return 'medium'
+        elif confidence < 0.8:
+            return 'medium-high'
+        else:
+            return 'high'
+        
+    def _generate_game_analysis_explanation(self, home_team, away_team, winner, win_prob, 
+                                     score_prediction, key_contributors, model_agreement, 
+                                     matchup_factors):
+        """Generate a detailed explanation of the game analysis in natural language"""
+        explanation = []
+        
+        # Explain the overall prediction
+        explanation.append(f"{winner} is projected to win with {win_prob*100:.1f}% probability.")
+        
+        # Add score prediction
+        explanation.append(f"Projected score: {score_prediction}")
+        
+        # Explain key contributors
+        home_contributors = key_contributors.get('home', [])
+        away_contributors = key_contributors.get('away', [])
+        
+        if home_contributors:
+            top_player = home_contributors[0]
+            explanation.append(f"Key contributor for {home_team}: {top_player['name']} with expected "
+                            f"{top_player['metric']} of {top_player['value']:.1f}.")
+        
+        if away_contributors:
+            top_player = away_contributors[0]
+            explanation.append(f"Key contributor for {away_team}: {top_player['name']} with expected "
+                            f"{top_player['metric']} of {top_player['value']:.1f}.")
+        
+        # Add context about model agreement
+        if model_agreement:
+            explanation.append("Both team-level and player-level models agree on this prediction.")
+        else:
+            explanation.append("Note: Team and player models show different projections, reducing confidence.")
+        
+        # Add matchup insights
+        significant_factors = {k: v for k, v in matchup_factors.items() if abs(v - 1.0) > 0.05}
+        if significant_factors:
+            most_significant = max(significant_factors.items(), key=lambda x: abs(x[1] - 1.0))
+            factor_name = most_significant[0].replace('_', ' ').title()
+            factor_impact = (most_significant[1] - 1.0) * 100
+            
+            if factor_impact > 0:
+                explanation.append(f"Matchup advantage: {factor_name} provides a {factor_impact:.1f}% boost.")
+            else:
+                explanation.append(f"Matchup challenge: {factor_name} causes a {abs(factor_impact):.1f}% reduction.")
+        
+        return " ".join(explanation)
+    def analyze_game_outcome(self, game_prediction: Dict[str, any], 
+                    home_players: List[Dict], away_players: List[Dict],
+                    home_team: str, away_team: str) -> Dict[str, any]:
+        """
+        Enhanced game analysis with robust error handling and improved metrics.
         
         Args:
-            game_prediction (Dict): Team model's game prediction dictionary
-            home_players (List[Dict]): List of home team player prediction dictionaries
-            away_players (List[Dict]): List of away team player prediction dictionaries
-            home_team (str): Name of the home team
-            away_team (str): Name of the away team
+            game_prediction: Team model's game prediction dictionary
+            home_players: List of home team player prediction dictionaries
+            away_players: List of away team player prediction dictionaries
+            home_team: Name of the home team
+            away_team: Name of the away team
             
         Returns:
             Dict: Enhanced game prediction with detailed analysis
         """
         try:
+            # Early validation of input data
+            if not home_players or not away_players:
+                self.logger.warning(f"Missing player data for {home_team} vs {away_team}")
+                return {
+                    'home_team': home_team,
+                    'away_team': away_team,
+                    'predicted_winner': game_prediction.get('predicted_winner', home_team if random.random() > 0.5 else away_team),
+                    'error': 'insufficient_player_data',
+                    'original_prediction': game_prediction
+                }
+                
             # Separate batters and pitchers
-            home_batters = [p for p in home_players if p['position'] != 'P']
-            home_pitchers = [p for p in home_players if p['position'] == 'P']
-            away_batters = [p for p in away_players if p['position'] != 'P']
-            away_pitchers = [p for p in away_players if p['position'] == 'P']
+            home_batters = [p for p in home_players if p.get('position') != 'P']
+            home_pitchers = [p for p in home_players if p.get('position') == 'P']
+            away_batters = [p for p in away_players if p.get('position') != 'P']
+            away_pitchers = [p for p in away_players if p.get('position') == 'P']
             
-            # Create batting dataframes
-            home_batting_data = []
-            for player in home_batters:
+            # Calculate player data quality (used for confidence calculation)
+            home_data_quality = min(1.0, len(home_batters) / 9) * min(1.0, len(home_pitchers) / 1)
+            away_data_quality = min(1.0, len(away_batters) / 9) * min(1.0, len(away_pitchers) / 1)
+            player_data_quality = (home_data_quality + away_data_quality) / 2
+            
+            # Process batting and pitching data using helper methods
+            home_batting_data = self._extract_batting_data(home_batters)
+            away_batting_data = self._extract_batting_data(away_batters)
+            home_pitching_data = self._extract_pitching_data(home_pitchers)
+            away_pitching_data = self._extract_pitching_data(away_pitchers)
+            
+            # Calculate expected runs with enhanced methodology
+            home_expected_runs = self._calculate_expected_runs(home_batting_data, away_pitching_data)
+            away_expected_runs = self._calculate_expected_runs(away_batting_data, home_pitching_data)
+            
+            # Incorporate head-to-head history
+            h2h_stats = self.h2h_stats if hasattr(self, 'h2h_stats') else game_prediction.get('h2h_stats', {})
+            h2h_adjustment = 0
+            
+            if h2h_stats and h2h_stats.get('total_games', 0) >= 3:
+                h2h_win_pct = h2h_stats.get('blended_win_pct', 0.5)
+                h2h_home_advantage = h2h_win_pct - 0.5
                 
-                    row = {
-                        'name': player['player_name'],
-                        'position': player['position'],
-                        'order': player['batting_order'],
-                        'R': player.get('pred_R', 0),
-                        'H': player.get('pred_H', 0),
-                        'RBI': player.get('pred_RBI', 0),
-                        'BB': player.get('pred_OBP', 0)
-                    }
-                    home_batting_data.append(row)
-            
-            away_batting_data = []
-            for player in away_batters:
-                    row = {
-                        'name': player['player_name'],
-                        'position': player['position'],
-                        'order': player['batting_order'],
-                        'R': player.get('pred_R', 0),
-                        'H': player.get('pred_H', 0),
-                        'RBI': player.get('pred_RBI', 0),
-                        'BB': player.get('pred_OBP', 0)
-                    }
-                    away_batting_data.append(row)
-            
-            # Create pitching dataframes
-            home_pitching_data = []
-            for player in home_pitchers:
-                if 'Sandoval' in player['player_name']:
-                    self.logger.info("Whit Merrifield detected, using special model")
-                row = {
-                    'name': player['player_name'],
-                    'IP': player.get('pred_IP', 0),
-                    'H': player.get('pred_H', 0),
-                    'R': player.get('pred_R', 0),
-                    'ER': player.get('pred_ERA', 0),
-                    #'BB': player['predictions'].get('BB', 0),
-                    'SO': player.get('pred_SO', 0)
-                }
-                home_pitching_data.append(row)
-            
-            away_pitching_data = []
-            for player in away_pitchers:
-                if 'Sandoval' in player['player_name']:
-                    self.logger.info("Whit Merrifield detected, using special model")
-                row = {
-                    'name': player['player_name'],
-                    'IP': player.get('pred_IP', 0),
-                    'H': player.get('pred_H', 0),
-                    'R': player.get('pred_R', 0),
-                    'ER': player.get('pred_ERA', 0),
-                    #'BB': player['predictions'].get('BB', 0),
-                    'SO': player.get('pred_SO', 0)
-                }
-                away_pitching_data.append(row)
-            
-            # Convert to dataframes
-            home_batting_df = pd.DataFrame(home_batting_data)
-            away_batting_df = pd.DataFrame(away_batting_data)
-            home_pitching_df = pd.DataFrame(home_pitching_data)
-            away_pitching_df = pd.DataFrame(away_pitching_data)
-            
-            # Calculate team-level run production and prevention
-            home_runs_scored = home_batting_df['R'].sum() if 'R' in home_batting_df.columns else 0
-            home_runs_allowed = home_pitching_df['R'].sum() if 'R' in home_pitching_df.columns else 0
-            away_runs_scored = away_batting_df['R'].sum() if 'R' in away_batting_df.columns else 0
-            away_runs_allowed = away_pitching_df['R'].sum() if 'R' in away_pitching_df.columns else 0
-            
-            # Compare with team model prediction
-            team_model_home_win_prob = game_prediction['home_win_probability']
-            team_model_winner = home_team if team_model_home_win_prob > 0.5 else away_team
-            
-            # Calculate expected score
-
-            expected_home_score = max(0, round((home_runs_scored + away_runs_allowed) / 2))
-            expected_away_score = max(0, round((away_runs_scored + home_runs_allowed) / 2))
-
-            runs_scored_diff = float(home_runs_scored - away_runs_scored)
-            runs_allowed_diff = float(home_runs_allowed - away_runs_allowed)
-
-            margin = runs_scored_diff - runs_allowed_diff
-            # Home team scores more
-            if runs_scored_diff > 0:
-                #Home team gives up more runs
-                if runs_allowed_diff > 0:
-                    if margin > 0:
-                        player_model_winner = home_team
-                        player_model_home_win_prob = 0.5 + min(0.4, margin * 0.05)
-                        #expected_home_score += runs_scored_diff * 0.1
-                    elif margin < 0:
-                        player_model_winner = away_team
-                        player_model_home_win_prob = 0.5 - min(0.4, abs(margin) * 0.05)
-                        #expected_away_score += away_runs_scored * 0.1
-                    else:
-                        player_model_winner = home_team
-                        player_model_home_win_prob = 0.5 + min(0.4, margin * 0.05)
+                # Scale by recency and sample size
+                recency_weight = min(0.15, 0.05 + (h2h_stats.get('total_games', 0) / 20) * 0.1)
+                h2h_adjustment = h2h_home_advantage * recency_weight
                 
-                #Home team gives up less runs
-                if runs_allowed_diff < 0:
-                    player_model_winner = home_team
-                    player_model_home_win_prob = 0.5 + min(0.4, margin * 0.05)
-
-            # Away team scores more
-            elif runs_scored_diff < 0:
-                # Away team gives up more runs
-                if runs_allowed_diff > 0:
-                    if margin < 0:
-                        player_model_winner = away_team
-                        player_model_home_win_prob = 0.5 + min(0.4, margin * 0.05)
-                        #expected_away_score += away_runs_scored_diff * 0.1
-                    elif margin > 0:
-                        player_model_winner = home_team
-                        player_model_home_win_prob = 0.5 - min(0.4, abs(margin) * 0.05)
-                        #expected_home_score += home_runs_scored * 0.1
-                    else:
-                        player_model_winner = home_team
-                        player_model_home_win_prob = 0.5 + min(0.4, margin * 0.05)
-
-                # Away team gives up less runs
-                if runs_allowed_diff < 0:
-                    player_model_winner = away_team
-                    player_model_home_win_prob = 0.5 + min(0.4, margin * 0.05)
-
+                # Factor in run differential as well
+                run_diff = h2h_stats.get('run_differential', 0)
+                if abs(run_diff) > 1.0:
+                    run_diff_adjustment = min(0.1, abs(run_diff) * 0.02) * (1 if run_diff > 0 else -1)
+                    h2h_adjustment += run_diff_adjustment
+            
+            # Calculate matchup-specific factors
+            matchup_factors = self._calculate_matchup_factors(home_team, away_team, 
+                                                        home_pitching_data, away_pitching_data,
+                                                        home_batting_data, away_batting_data)
+            
+            # Apply matchup factors to expected runs
+            for factor, value in matchup_factors.items():
+                if 'home' in factor:
+                    home_expected_runs *= value
+                elif 'away' in factor:
+                    away_expected_runs *= value
+            
+            # Player model win probability
+            player_model_home_win_prob = 0.5
+            if home_expected_runs != away_expected_runs:
+                # Calculate win probability based on Pythagoras expectation formula
+                run_diff = home_expected_runs - away_expected_runs
+                player_model_home_win_prob = 0.5 + (run_diff / (abs(run_diff) + 4)) * 0.5
+                
+                # Ensure probability is within valid range
+                player_model_home_win_prob = max(0.05, min(0.95, player_model_home_win_prob))
+            
+            # Get team model probability
+            team_model_home_win_prob = game_prediction.get('home_win_probability', 0.5)
+            
+            # Determine model agreement
+            player_model_winner = home_team if player_model_home_win_prob > 0.5 else away_team
+            team_model_winner = game_prediction.get('predicted_winner', 
+                                                home_team if team_model_home_win_prob > 0.5 else away_team)
+            model_agreement = player_model_winner == team_model_winner
+            
+            # Weighted model combination with adaptive weights
+            if model_agreement:
+                # Models agree, weight based on confidence
+                team_weight = 0.6
+                player_weight = 0.4
             else:
-                player_model_home_win_prob = 0.5
+                # Models disagree, adjust weights based on data quality
+                team_quality = game_prediction.get('confidence', 'medium')
+                team_quality_map = {'low': 0.3, 'medium-low': 0.4, 'medium': 0.5, 'medium-high': 0.7, 'high': 0.8}
+                team_quality_factor = team_quality_map.get(team_quality, 0.5)
                 
-
-
-            # # Calculate weighted final prediction (60% team model, 40% player model)
-            # combined_home_win_prob = (team_model_home_win_prob * 0.4) + (player_model_home_win_prob * 0.6)
-            # final_winner = home_team if combined_home_win_prob > 0.5 else away_team
-            # final_win_prob = combined_home_win_prob if final_winner == home_team else 1 - combined_home_win_prob
-
-            if player_model_winner != team_model_winner:
-                # Calculate how far each model's probability is from 0.5
-                team_model_confidence = abs(team_model_home_win_prob - 0.5)
-                player_model_confidence = abs(player_model_home_win_prob - 0.5)
-                
-                # If both models have low confidence (close to 0.5), use weighted approach
-                if team_model_confidence < 0.045 and player_model_confidence < 0.045:
-                    # Use original weighted approach for low-confidence predictions
-                    combined_home_win_prob = (team_model_home_win_prob * 0.6) + (player_model_home_win_prob * 0.4)
-                    confidence = 'low'
-                else:
-                    # Use the model with higher confidence (further from 0.5)
-                    if team_model_confidence > player_model_confidence:
-                        combined_home_win_prob = team_model_home_win_prob
-                        confidence = 'medium' if team_model_confidence < 0.15 else 'high'
-                    else:
-                        combined_home_win_prob = player_model_home_win_prob
-                        confidence = 'medium' if player_model_confidence < 0.15 else 'high'
-            else:
-                # Models agree, use weighted approach with increased confidence
-                combined_home_win_prob = (team_model_home_win_prob * 0.6) + (player_model_home_win_prob * 0.4)
-                
-                # Determine confidence based on agreement and distance from 0.5
-                avg_confidence = (abs(team_model_home_win_prob - 0.5) + abs(player_model_home_win_prob - 0.5)) / 2
-                if avg_confidence < 0.05:
-                    confidence = 'low'
-                elif avg_confidence < 0.15:
-                    confidence = 'medium'
-                else:
-                    confidence = 'high'
-
-            # Determine final winner and win probability
+                # If player data quality is high, give it more weight in disagreement
+                team_weight = min(0.7, max(0.3, team_quality_factor))
+                player_weight = 1 - team_weight
+            
+            # Calculate combined probability
+            combined_home_win_prob = (team_model_home_win_prob * team_weight) + (player_model_home_win_prob * player_weight) + h2h_adjustment
+            
+            # Ensure probability is within valid range
+            combined_home_win_prob = max(0.05, min(0.95, combined_home_win_prob))
+            
+            # Determine final prediction
             final_winner = home_team if combined_home_win_prob > 0.5 else away_team
-            final_win_prob = combined_home_win_prob if final_winner == home_team else 1 - combined_home_win_prob
-
+            final_win_prob = combined_home_win_prob if final_winner == home_team else (1 - combined_home_win_prob)
+            
+            # Calculate expected score (rounded to nearest integer)
+            home_score = max(0, round(home_expected_runs))
+            away_score = max(0, round(away_expected_runs))
+            
+            # Ensure score is consistent with winner
+            if (home_score > away_score and final_winner == away_team) or (home_score < away_score and final_winner == home_team):
+                if final_winner == home_team:
+                    home_score = away_score + 1
+                else:
+                    away_score = home_score + 1
+            
+            # Calculate confidence level
+            confidence = self._calculate_confidence_score(
+                game_prediction.get('confidence', 'medium'),
+                model_agreement,
+                player_data_quality
+            )
+            
+            # Identify key contributors to predicted outcome
+            key_contributors = self._identify_key_contributors(
+                home_batting_data, away_batting_data,
+                home_pitching_data, away_pitching_data
+            )
+            
+            # Generate detailed explanation
+            explanation = self._generate_game_analysis_explanation(
+                home_team, away_team,
+                final_winner, final_win_prob,
+                f"{away_team} {away_score}, {home_team} {home_score}",
+                key_contributors,
+                model_agreement,
+                matchup_factors
+            )
             
             # Create detailed analysis result
             analysis_result = {
                 'home_team': home_team,
                 'away_team': away_team,
-                'home_batting_stats': home_batting_df.to_dict('records') if not home_batting_df.empty else [],
-                'away_batting_stats': away_batting_df.to_dict('records') if not away_batting_df.empty else [],
-                'home_pitching_stats': home_pitching_df.to_dict('records') if not home_pitching_df.empty else [],
-                'away_pitching_stats': away_pitching_df.to_dict('records') if not away_pitching_df.empty else [],
-                'home_runs_scored': home_runs_scored,
-                'home_runs_allowed': home_runs_allowed,
-                'away_runs_scored': away_runs_scored,
-                'away_runs_allowed': away_runs_allowed,
+                'home_batting_stats': home_batting_data,
+                'away_batting_stats': away_batting_data,
+                'home_pitching_stats': home_pitching_data,
+                'away_pitching_stats': away_pitching_data,
+                'home_runs_scored': home_expected_runs,
+                'home_runs_allowed': away_expected_runs,
+                'away_runs_scored': away_expected_runs,
+                'away_runs_allowed': home_expected_runs,
                 'player_model_winner': player_model_winner,
                 'player_model_home_win_prob': player_model_home_win_prob,
                 'team_model_winner': team_model_winner,
                 'team_model_home_win_prob': team_model_home_win_prob,
+                'h2h_adjustment': h2h_adjustment,
+                'matchup_factors': matchup_factors,
                 'combined_home_win_prob': combined_home_win_prob,
                 'predicted_winner': final_winner,
                 'win_probability': final_win_prob,
-                'predicted_score': f"{away_team} {expected_away_score}, {home_team} {expected_home_score}",
-                'agreement': player_model_winner == team_model_winner,
-                'confidence': 'high' if abs(combined_home_win_prob - 0.5) > 0.2 else 
-                            ('medium' if abs(combined_home_win_prob - 0.5) > 0.1 else 'low')
-            }
-            
-            # Add original game prediction data
-            analysis_result.update({
+                'predicted_score': f"{away_team} {away_score}, {home_team} {home_score}",
+                'agreement': model_agreement,
+                'confidence': confidence,
+                'key_contributors': key_contributors,
+                'explanation': explanation,
                 'original_prediction': game_prediction
-            })
+            }
             
             return analysis_result
             
@@ -1670,6 +2553,8 @@ class BaseballPredictor:
             self.logger.error(f"Error analyzing game outcome: {e}")
             return {
                 'error': str(e),
+                'home_team': home_team,
+                'away_team': away_team,
                 'predicted_winner': game_prediction.get('predicted_winner', 'Unknown'),
                 'original_prediction': game_prediction
             }
@@ -2929,7 +3814,12 @@ def main():
     # Load data
     predictor.load_data(args.target_date)
 
-        # Train or load models
+    # Enable enhanced features if requested
+    if args.enhanced_features:
+        predictor.enhance_features()
+        print("Enhanced feature engineering enabled")
+    
+    # Train or load models
     if args.train:
         predictor.train_models()
         if args.save_models:
@@ -2939,10 +3829,7 @@ def main():
     else:
         predictor.train_models()  # Default to training if not specified
     
-    # Enable enhanced features if requested
-    if args.enhanced_features:
-        predictor.enhance_features()
-        print("Enhanced feature engineering enabled")
+
     
     # Load weather data if provided
     if args.weather_file and os.path.exists(args.weather_file):
@@ -3036,6 +3923,12 @@ def main():
             print(f"Home Win Probability: {game_prediction['home_win_probability']:.2%}")
             print(f"Away Win Probability: {game_prediction['away_win_probability']:.2%}")
             print(f"Confidence: {game_prediction['confidence']}")
+
+            # Add this after line 3186 in main()
+            print(f"Predicted Winner: {game_prediction['predicted_winner']} ({game_prediction['win_probability']:.2%})")
+            print(f"Expected Margin: {abs(game_prediction['win_margin']):.1f} runs")
+            if 'explanation' in game_prediction:
+                print(f"Analysis: {game_prediction['explanation']}")
 
             predictions_home = []
             predictions_away = []
